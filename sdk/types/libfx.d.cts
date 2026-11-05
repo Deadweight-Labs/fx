@@ -693,19 +693,27 @@ export interface FxAnthropicProviderSettings {
   strict_tools?: string[];
 }
 
-/** A server that speaks OpenAI Chat Completions, such as a local model server or a router, or the Anthropic Messages API. */
-export interface FxCustomProviderDefinition {
+interface FxCustomProviderCommon {
   /** Names the provider to `credentials()`: a letter, then letters, digits, `_` or `-`, at most 64 characters. Not `gateway`, `codex` or `grok`. */
   name: string;
-  /** Defaults to `openai-chat-completions`. */
-  protocol?: "openai-chat-completions" | "anthropic-messages";
-  /** The API prefix: requests go to `{baseUrl}/chat/completions`, or `{baseUrl}/v1/messages` for Anthropic, where it defaults to `https://api.anthropic.com`. HTTPS, or HTTP on localhost. */
-  baseUrl?: string;
-  /** The models it serves, by id. The current Claude models are known without it. */
+  /** The models it serves, by id. */
   models?: Record<string, FxCustomProviderModel>;
-  /** Only with `protocol: "anthropic-messages"`. */
-  anthropic?: FxAnthropicProviderSettings;
 }
+
+/** A server that speaks OpenAI Chat Completions, such as a local model server or a router, or the Anthropic Messages API. */
+export type FxCustomProviderDefinition =
+  | (FxCustomProviderCommon & {
+      protocol?: "openai-chat-completions";
+      /** The API prefix: requests go to `{baseUrl}/chat/completions`. HTTPS, or HTTP on localhost. */
+      baseUrl: string;
+      anthropic?: undefined;
+    })
+  | (FxCustomProviderCommon & {
+      protocol: "anthropic-messages";
+      /** Requests go to `{baseUrl}/v1/messages`. Defaults to `https://api.anthropic.com`. HTTPS, or HTTP on localhost. The current Claude models are known without `models`. */
+      baseUrl?: string;
+      anthropic?: FxAnthropicProviderSettings;
+    });
 
 /** A custom provider's API key. */
 export interface FxApiKeyCredentials {

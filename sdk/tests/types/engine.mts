@@ -335,3 +335,13 @@ export async function grokEngine(): Promise<FxEngine> {
   await createFxEngine({ provider: "grok", credentials: ({ provider, sessionId }) => planTokens.load(provider, sessionId) });
   return engine;
 }
+
+{
+  const model = "claude-haiku-5-5";
+  await createFxEngine({ provider: { name: "claude", protocol: "anthropic-messages" }, model, credentials: () => ({ apiKey: "key" }) });
+  await createFxEngine({ provider: { name: "claude", protocol: "anthropic-messages", anthropic: { compaction: { trigger_tokens: 150000 }, prompt_caching: false } }, model });
+  // @ts-expect-error Anthropic settings belong to the anthropic-messages protocol
+  await createFxEngine({ provider: { name: "router", baseUrl: "https://models.example/v1", anthropic: {} }, model });
+  // @ts-expect-error settings use the CLI's names
+  await createFxEngine({ provider: { name: "claude", protocol: "anthropic-messages", anthropic: { promptCaching: false } }, model });
+}
