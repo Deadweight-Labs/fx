@@ -44,6 +44,7 @@ pub fn bundle(raw: ?*anyopaque, definition: *const definitions.Definition) provi
     const context: *Context = @ptrCast(@alignCast(raw orelse return .{}));
     const own = context.definition();
     if (!std.mem.eql(u8, &own.binding_identity(), &definition.binding_identity())) return .{};
+    if (own.protocol == .@"anthropic-messages") return @import("host_anthropic_messages.zig").bundle(context);
     return .{
         .agent_stream = .{
             .context = context,

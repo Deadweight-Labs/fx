@@ -1,5 +1,6 @@
 // A custom provider for libfx agents: any server that speaks OpenAI Chat
-// Completions, such as a local model server or a router. The engine sends its
+// Completions, such as a local model server or a router, or the Anthropic
+// Messages API with the app's own key. The engine sends its
 // requests through the host's fetch without credentials; when the host has an
 // API key, this module adds it at the fetch edge, to that provider's chat URL
 // only. The key never enters the engine or a session's saved records.
@@ -10,7 +11,9 @@ const encoder = new TextEncoder();
 const reservedNames = new Set(["gateway", "codex", "grok"]);
 const namePattern = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
-const providerFields = new Set(["name", "baseUrl", "models"]);
+const providerFields = new Set(["name", "protocol", "baseUrl", "models", "anthropic"]);
+const protocols = new Set(["openai-chat-completions", "anthropic-messages"]);
+const anthropicBaseUrl = "https://api.anthropic.com";
 // libfx option names to the CLI's settings names, which the engine parses.
 const modelFields = {
   contextWindow: "context_window",
@@ -23,11 +26,11 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function chatUrlOf(baseUrl) {
+function chatUrlOf(baseUrl, path = "/chat/completions") {
   if (typeof baseUrl !== "string") throw new TypeError("provider.baseUrl must be a string");
   let url;
   try {
-    url = new URL(`${baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl}/chat/completions`);
+    url = new URL(`${baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl}${path}`);
   } catch {
     throw new TypeError("provider.baseUrl must be an absolute URL");
   }
@@ -76,29 +79,36 @@ function modelMetadata(models) {
 }
 
 /**
- * Checks a custom provider `{ name, baseUrl, models? }` and returns its name,
- * the chat URL its key may go to, and the settings-style JSON the engine
- * parses. The engine applies the CLI's complete rules; these checks only catch
- * mistakes early with a clearer message.
+ * Checks a custom provider `{ name, protocol?, baseUrl, models?, anthropic? }`
+ * and returns its name, the URL its key may go to, and the settings-style JSON
+ * the engine parses. The engine applies the CLI's complete rules; these checks
+ * only catch mistakes early with a clearer message.
  */
 export function customProviderDefinition(provider) {
   if (!isPlainObject(provider)) throw new TypeError("a custom provider must be an object { name, baseUrl, models? }");
   for (const field of Object.keys(provider)) {
     if (!providerFields.has(field)) throw new TypeError(`a custom provider has unknown field ${field}`);
   }
-  const { name, baseUrl, models } = provider;
+  const { name, protocol = "openai-chat-completions", models, anthropic } = provider;
   if (typeof name !== "string" || !namePattern.test(name) || reservedNames.has(name.toLowerCase())) {
     throw new TypeError("provider.name must be a letter followed by letters, digits, _ or -, at most 64 characters, and not gateway, codex or grok");
   }
-  const chatUrl = chatUrlOf(baseUrl);
+  if (!protocols.has(protocol)) throw new TypeError(`provider.protocol must be one of ${[...protocols].join(", ")}`);
+  const isAnthropic = protocol === "anthropic-messages";
+  if (anthropic !== undefined && (!isAnthropic || !isPlainObject(anthropic))) {
+    throw new TypeError("provider.anthropic is an object of settings for the anthropic-messages protocol only");
+  }
+  const baseUrl = provider.baseUrl ?? (isAnthropic ? anthropicBaseUrl : undefined);
+  const chatUrl = chatUrlOf(baseUrl, isAnthropic ? "/v1/messages" : "/chat/completions");
   const definition = {
-    protocol: "openai-chat-completions",
+    protocol,
     base_url: baseUrl,
     // The host adds the key, so the engine's copy has none.
     auth: { type: "none" },
     ...(models === undefined ? {} : { model_metadata: modelMetadata(models) }),
+    ...(anthropic === undefined ? {} : { anthropic }),
   };
-  return { name, chatUrl, json: JSON.stringify({ [name]: definition }) };
+  return { name, chatUrl, apiKeyHeader: isAnthropic ? "x-api-key" : "authorization", json: JSON.stringify({ [name]: definition }) };
 }
 
 /**
@@ -107,7 +117,7 @@ export function customProviderDefinition(provider) {
  * names the agent's session. A key has no refresh token, so it is never
  * refreshed, and a rejected request returns as it is.
  */
-export function customProviderSpec({ name, chatUrl }, sessionId) {
+export function customProviderSpec({ name, chatUrl, apiKeyHeader = "authorization" }, sessionId) {
   return {
     provider: name,
     matches: (endpoint) => endpoint === chatUrl,
@@ -117,7 +127,8 @@ export function customProviderSpec({ name, chatUrl }, sessionId) {
       return { accessToken: tokenString(value.apiKey, "apiKey", true, `provider "${name}"`) };
     },
     authorize(headers, _endpoint, credentials) {
-      headers.set("authorization", `Bearer ${credentials.accessToken}`);
+      if (apiKeyHeader === "x-api-key") headers.set("x-api-key", credentials.accessToken);
+      else headers.set("authorization", `Bearer ${credentials.accessToken}`);
     },
   };
 }
