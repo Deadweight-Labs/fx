@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const anthropic_options = @import("anthropic_provider_options.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -28,9 +29,10 @@ pub const ParseError = Allocator.Error || error{
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
+    InvalidAnthropicOptions,
 };
 
-pub const Protocol = enum { @"openai-chat-completions" };
+pub const Protocol = enum { @"openai-chat-completions", @"anthropic-messages" };
 pub const ToolChoiceMode = enum { omit, send };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
@@ -58,6 +60,13 @@ pub const Definition = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
+    /// Read only by the `anthropic-messages` protocol.
+    anthropic: anthropic_options.Options = .{},
+
+    /// Caller owns the returned URL. base_url has no `/v1` for Anthropic.
+    pub fn messages_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.base_url, "/v1/messages" });
+    }
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -100,6 +109,7 @@ pub const Definition = struct {
         if (self.reviewer_model) |id| alloc.free(id);
         for (self.model_metadata) |metadata| alloc.free(metadata.id);
         alloc.free(self.model_metadata);
+        self.anthropic.deinit(alloc);
     }
 };
 
@@ -165,13 +175,17 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
-    const protocol = try required(value, "protocol");
-    if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
-    const url = try required(value, "base_url");
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "anthropic" });
+    const protocol_value = try required(value, "protocol");
+    if (protocol_value != .string) return error.InvalidProtocol;
+    const protocol = std.meta.stringToEnum(Protocol, protocol_value.string) orelse return error.InvalidProtocol;
+    const anthropic = protocol == .@"anthropic-messages";
+    if (!anthropic and value.object.contains("anthropic")) return error.UnknownField;
+    // Anthropic definitions default to the public API and its usual key.
+    const url = if (anthropic) value.object.get("base_url") orelse std.json.Value{ .string = anthropic_options.default_base_url } else try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
-    const auth = try parse_auth(try required(value, "auth"));
+    const auth = if (anthropic and !value.object.contains("auth")) Auth{ .bearer = anthropic_options.default_api_key_env } else try parse_auth(try required(value, "auth"));
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
@@ -198,9 +212,12 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
+    const options: anthropic_options.Options = if (value.object.get("anthropic")) |raw| try anthropic_options.parse(alloc, raw) else .{};
+    errdefer options.deinit(alloc);
     return .{
         .id = owned_id,
-        .protocol = .@"openai-chat-completions",
+        .protocol = protocol,
+        .anthropic = options,
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
