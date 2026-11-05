@@ -219,6 +219,28 @@ fn checkSchemaDepth(value: std.json.Value, depth: usize) Error!void {
     }
 }
 
+/// A copy of `schema` with `additionalProperties: false` on every object
+/// schema that does not set it.
+fn closeObjects(arena: Allocator, schema: std.json.Value) Allocator.Error!std.json.Value {
+    switch (schema) {
+        .object => |fields| {
+            var copy: std.json.ObjectMap = .empty;
+            var iterator = fields.iterator();
+            while (iterator.next()) |entry| try copy.put(arena, entry.key_ptr.*, try closeObjects(arena, entry.value_ptr.*));
+            const kind = fields.get("type");
+            const is_object = kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "object");
+            if (is_object and !fields.contains("additionalProperties")) try copy.put(arena, "additionalProperties", .{ .bool = false });
+            return .{ .object = copy };
+        },
+        .array => |items| {
+            var copy = std.json.Array.init(arena);
+            for (items.items) |item| try copy.append(try closeObjects(arena, item));
+            return .{ .array = copy };
+        },
+        else => return schema,
+    }
+}
+
 /// Maps a tool name from the reply back to fx's name.
 fn originalName(functions: []const Function, wire: []const u8) []const u8 {
     for (functions) |function| {
@@ -605,11 +627,17 @@ const Renderer = struct {
             try s.writeAll(",\"description\":");
             try model_tool_schema.writeCappedDescriptionJsonString(self.arena, s, function.description);
             try s.writeAll(",\"input_schema\":");
+            // Strict tools need every object schema closed.
+            const strict = containsName(self.settings.options.strict_tools, function.name);
             switch (function.schema) {
-                .builtin => |schema| try model_tool_schema.writeObjectSchema(self.arena, s, schema),
-                .dynamic => |schema| try std.json.Stringify.value(schema, .{}, s),
+                .builtin => |schema| {
+                    var sent = schema;
+                    if (strict) sent.additional_properties = false;
+                    try model_tool_schema.writeObjectSchema(self.arena, s, sent);
+                },
+                .dynamic => |schema| try std.json.Stringify.value(if (strict) try closeObjects(self.arena, schema) else schema, .{}, s),
             }
-            if (containsName(self.settings.options.strict_tools, function.name)) try s.writeAll(",\"strict\":true");
+            if (strict) try s.writeAll(",\"strict\":true");
             try s.writeByte('}');
         }
         try s.writeByte(']');
@@ -1465,6 +1493,7 @@ test "anthropic request maps system, tools, effort, thinking and caching" {
     const tools = root.get("tools").?.array.items;
     try std.testing.expectEqualStrings("read_file", tools[0].object.get("name").?.string);
     try std.testing.expect(tools[0].object.get("strict").?.bool);
+    try std.testing.expect(!tools[0].object.get("input_schema").?.object.get("additionalProperties").?.bool);
     try std.testing.expectEqualStrings("object", tools[0].object.get("input_schema").?.object.get("type").?.string);
     // Dots are not allowed in Anthropic tool names.
     try std.testing.expectEqualStrings("skill__run", tools[1].object.get("name").?.string);
