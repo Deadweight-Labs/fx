@@ -1115,7 +1115,7 @@ pub const Reducer = struct {
         const kind = try string(root.get("type") orelse return error.InvalidChunk);
         if (std.mem.eql(u8, kind, "ping")) return .{};
         if (std.mem.eql(u8, kind, "error")) {
-            try self.acceptError(root);
+            try self.acceptError(root, data);
             self.phase = .stopped;
             return .{};
         }
@@ -1151,10 +1151,7 @@ pub const Reducer = struct {
                 if (nonNull(delta, "stop_details")) |details| self.stop_details = try std.json.Stringify.valueAlloc(self.arena(), details, .{});
             }
             if (nonNull(root, "usage")) |usage| try self.acceptUsage(usage);
-            if (nonNull(root, "context_management")) |management| {
-                const encoded = try std.json.Stringify.valueAlloc(self.arena(), management, .{});
-                debug_trace.logf("gateway", "anthropic_context_management {s}", .{encoded[0..@min(encoded.len, 512)]});
-            }
+            if (nonNull(root, "context_management") != null) debug_trace.logf("gateway", "anthropic_context_management_applied", .{});
             return .{};
         }
         if (std.mem.eql(u8, kind, "message_stop")) {
@@ -1165,8 +1162,9 @@ pub const Reducer = struct {
         return .{};
     }
 
-    fn acceptError(self: *Reducer, root: std.json.ObjectMap) Error!void {
-        const detail = try std.json.Stringify.valueAlloc(self.arena(), std.json.Value{ .object = root }, .{});
+    /// `data` is the event as it arrived, which becomes the failure's detail.
+    fn acceptError(self: *Reducer, root: std.json.ObjectMap, data: []const u8) Error!void {
+        const detail = try self.arena().dupe(u8, data);
         var kind: stream_provider.FailureKind = .provider_error;
         if (nonNull(root, "error")) |value| if (value == .object) if (nonNull(value.object, "type")) |name| if (name == .string) {
             kind = errorKind(name.string);
@@ -1315,10 +1313,9 @@ pub const Reducer = struct {
         if (nonNull(fields, "output_tokens_details")) |details| {
             if (try tokenCount(try object(details), "thinking_tokens")) |count| self.usage.thinking = count;
         }
-        if (nonNull(fields, "iterations")) |iterations| {
-            const encoded = try std.json.Stringify.valueAlloc(self.arena(), iterations, .{});
-            debug_trace.logf("gateway", "anthropic_usage_iterations {s}", .{encoded[0..@min(encoded.len, 512)]});
-        }
+        if (nonNull(fields, "iterations")) |iterations| if (iterations == .array) {
+            debug_trace.logf("gateway", "anthropic_usage_iterations count={d}", .{iterations.array.items.len});
+        };
     }
 
     fn finalUsage(self: *const Reducer) types.Usage {
