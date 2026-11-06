@@ -1,0 +1,90 @@
+# Keeps this fork's main up to date with vercel-labs/fx main, once a day and
+# on demand. GitHub's merge-upstream merges upstream into main with a merge
+# commit, or refuses on a conflict and changes nothing; a conflict opens (or
+# updates) an issue instead.
+#
+# Upstream's release, publishing and nightly workflows need secrets and
+# runners this fork does not have, so they stay disabled. A workflow a merge
+# brings in that is not on the list below is disabled too and reported, and
+# after every merge CI runs on main, since pushes made with this workflow's
+# token start no workflows themselves.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  ISSUE_TITLE: Upstream sync needs attention
+  # Workflows that may run on this fork; any other is disabled.
+  ALLOWED: >-
+    .github/workflows/sync-upstream.yml
+    .github/workflows/ci.yml
+    .github/workflows/macos.yml
+    .github/workflows/examples.yml
+    .github/workflows/bench.yml
+    .github/workflows/binary-size.yml
+    .github/workflows/tla-mcp-call.yml
+    .github/workflows/pgso-linux-arm64.yml
+    .github/workflows/pgso-linux-x86_64.yml
+    .github/workflows/pgso-macos-arm64.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Merge upstream main
+        id: sync
+        run: |
+          if out=$(gh api -X POST "repos/$GH_REPO/merge-upstream" -f branch=main 2>&1); then
+            echo "$out"
+            echo "result=$(jq -r .merge_type <<<"$out")" >> "$GITHUB_OUTPUT"
+          else
+            echo "$out"
+            echo "result=refused" >> "$GITHUB_OUTPUT"
+            printf 'GitHub could not merge upstream main into main, most likely because of a conflict:\n\n```\n%s\n```\n\nResolve it locally: `git fetch upstream && git merge upstream/main`, then push main.\n' "$out" > report.md
+          fi
+
+      - name: Disable workflows that are not on the list
+        run: |
+          gh workflow list --all --json id,path,state --jq '.[] | select(.state == "active") | "\(.id) \(.path)"' |
+            while read -r id path; do
+              case " $ALLOWED " in *" $path "*) continue ;; esac
+              gh workflow disable "$id"
+              echo "- disabled \`$path\`, which upstream added" >> disabled.md
+            done
+          if [ -s disabled.md ]; then
+            { echo "A merge brought in workflows that are not on the list in sync-upstream.yml, so they were disabled. Enable one only after checking what it does:"; echo; cat disabled.md; } >> report.md
+          fi
+
+      - name: Run CI on the merged main
+        if: steps.sync.outputs.result == 'merge' || steps.sync.outputs.result == 'fast-forward'
+        run: gh workflow run ci.yml --ref main
+
+      - name: Report
+        if: hashFiles('report.md') != ''
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          echo "" >> report.md
+          echo "Run: $RUN_URL" >> report.md
+          number=$(gh issue list --state open --search "$ISSUE_TITLE in:title" --json number --jq '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file report.md
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file report.md
+          fi
