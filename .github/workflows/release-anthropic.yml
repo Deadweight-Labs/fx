@@ -40,7 +40,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             TAG="$GITHUB_REF_NAME"
           elif [ "$GITHUB_REF_NAME" = main ]; then
-            LAST=$(git tag -l "v${BASE}-anthropic.*" | sed 's/.*-anthropic\.//' | grep -E '^[0-9]+$' | sort -n | tail -1)
+            LAST=$(git tag -l "v${BASE}-anthropic.*" | sed 's/.*-anthropic\.//' | { grep -E '^[0-9]+$' || true; } | sort -n | tail -1)
             TAG="v${BASE}-anthropic.$(( ${LAST:-0} + 1 ))"
           else
             echo "::error::release from main or from a v*-anthropic.* tag"
@@ -98,6 +98,22 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
+
+      # Upstream's updates have no Anthropic transport, so the released CLI
+      # never replaces itself with one. main keeps upstream's behavior, which
+      # upstream's tests cover. A change upstream that moves this line fails
+      # the release instead of shipping a CLI that updates itself.
+      - name: Turn off background updates in the released CLI
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          path = "src/core/upgrade/auto_upgrade.zig"
+          source = open(path).read()
+          line = "pub fn shouldEnableForCurrentExecutable() bool {\n"
+          if source.count(line) != 1:
+              raise SystemExit(f"{path} no longer has shouldEnableForCurrentExecutable(); update this step")
+          open(path, "w").write(source.replace(line, line + "    if (true) return false;\n"))
+          EOF
 
       - name: Build the fx CLI
         run: zig build -Doptimize=ReleaseSafe ${{ matrix.cli_flags }}
