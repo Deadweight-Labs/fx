@@ -1280,16 +1280,22 @@ pub const Reducer = struct {
         var stored: std.Io.Writer.Allocating = .init(arena_alloc);
         var compaction = false;
         var replayable = true;
+        // fx's canonical form is at most one text block, before every tool call.
+        var texts: usize = 0;
+        var seen_tool = false;
         for (self.blocks.items) |block| {
             const before = stored.written().len;
             const kind: u8 = switch (block.kind) {
                 .text => {
                     if (block.text.items.len == 0) continue;
+                    // Text after a tool call is out of canonical order too.
+                    texts += if (seen_tool) 2 else 1;
                     try separatedEntry(&layout, 't');
                     try layout.writer.print("{d}", .{block.text.items.len});
                     continue;
                 },
                 .tool_use => {
+                    seen_tool = true;
                     for (block.id) |byte| if (byte <= ' ' or byte >= 0x7f) {
                         replayable = false;
                     };
@@ -1324,9 +1330,9 @@ pub const Reducer = struct {
         const prefix: []const u8 = if (compaction) compaction_prefix else &self.prefix;
         const state_len = replay_magic.len + prefix.len + 1 + layout.written().len + 1 + stored.written().len;
         if (state_len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
-        // Without thinking or compaction there is nothing fx's own message
-        // cannot rebuild, so the reply goes back in its canonical form.
-        if (!replayable or stored.written().len == 0) return null;
+        // Without thinking or compaction, and in the canonical block order,
+        // fx's own message rebuilds the reply exactly: no replay is kept.
+        if (!replayable or (stored.written().len == 0 and texts <= 1)) return null;
         return try std.mem.concat(arena_alloc, u8, &.{ replay_magic, prefix, "\n", layout.written(), "\n", stored.written() });
     }
 
@@ -1973,4 +1979,31 @@ test "anthropic thinking survives a change of effort and earlier replay formats 
     defer alloc.free(legacy_body);
     try std.testing.expect(std.mem.find(u8, legacy_body, "signature") == null);
     try expectContains(legacy_body, "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"toolu_A\"");
+}
+
+test "anthropic replies without thinking go back in their own block order" {
+    const alloc = std.testing.allocator;
+    const start = sseEvent("message_start", "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_o\",\"usage\":{\"input_tokens\":5}}}");
+    const text0 = sseEvent("content_block_start", "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"First.\"}}") ++ sseEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}");
+    const tool1 = sseEvent("content_block_start", "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_o\",\"name\":\"read_file\",\"input\":{\"path\":\"a\"}}}") ++ sseEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":1}");
+    const text2 = sseEvent("content_block_start", "{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"Then.\"}}") ++ sseEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":2}");
+    const stop = sseEvent("message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}") ++ sseEvent("message_stop", "{\"type\":\"message_stop\"}");
+    const request = testRequest("claude-haiku-5-5", &.{.{ .role = .user, .content = "go" }});
+
+    var plain = try testStream(alloc, request, start ++ text0 ++ tool1 ++ stop, null);
+    defer plain.deinit(alloc);
+    try std.testing.expect(plain.completed.completion.provider_state_json == null);
+
+    var mixed = try testStream(alloc, request, start ++ text0 ++ tool1 ++ text2 ++ stop, null);
+    defer mixed.deinit(alloc);
+    const completion = mixed.completed.completion;
+    try std.testing.expectEqualStrings("First.\n\nThen.", completion.content.?);
+    const next = [_]types.ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .assistant, .content = completion.content, .tool_calls = completion.tool_calls, .provider_replay = .{ .source = .{ .provider = test_provider, .model = "claude-haiku-5-5" }, .parts_json = completion.provider_state_json.? } },
+        .{ .role = .tool, .tool_call_id = "toolu_o", .tool_name = "read_file", .content = "A" },
+    };
+    const body = try build_request(alloc, testRequest("claude-haiku-5-5", &next), testSettings(&test_options));
+    defer alloc.free(body);
+    try expectContains(body, "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"First.\"},{\"type\":\"tool_use\",\"id\":\"toolu_o\",\"name\":\"read_file\",\"input\":{\"path\":\"a\"}},{\"type\":\"text\",\"text\":\"Then.\"}]}");
 }
