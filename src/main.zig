@@ -5372,6 +5372,7 @@ test {
     _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
+    _ = @import("core/config/tool_placement.zig");
     _ = @import("core/session/session_title_generation.zig");
     _ = @import("ui/footer/agents_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
@@ -5488,6 +5489,7 @@ test {
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
     _ = @import("core/tooling/tool_projection.zig");
+    _ = @import("core/tooling/toolbox.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
     _ = @import("core/hosts/js_host_workspace.zig");
@@ -5516,6 +5518,7 @@ test {
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
+    _ = @import("tools/capabilities/toolbox.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");
     _ = @import("core/upgrade/upgrade_runtime.zig");
     _ = @import("core/shared/types.zig");
