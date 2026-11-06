@@ -211,7 +211,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         }
         return .{ .failed = .{ .kind = failureKind(alloc, response.head.status, detail), .http_status = response.head.status, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume(alloc, definition, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    var result = consume(alloc, payload, reader, request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
@@ -227,11 +227,11 @@ pub fn failureKind(alloc: Allocator, status: std.http.Status, detail: []const u8
 
 /// Parses a successful streamed reply from `reader`, telling `progress` about
 /// each event when it is set.
-pub fn consume(alloc: Allocator, definition: *const definitions.Definition, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+/// `body` is the request that was sent.
+pub fn consume(alloc: Allocator, body: []const u8, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    const identity = bound_identity(definition);
-    return codec.consume_stream(alloc, reader, request.data(), .{ .options = &definition.anthropic, .provider = &identity }, limits, request.events, request.cancel_flag, progress);
+    return codec.consume_stream(alloc, reader, request.data(), body, limits, request.events, request.cancel_flag, progress);
 }
 
 // ---------------------------------------------------------------------------

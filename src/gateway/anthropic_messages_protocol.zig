@@ -301,25 +301,31 @@ fn validateHistory(alloc: Allocator, messages: []const types.ChatMessage) Error!
 }
 
 // ---------------------------------------------------------------------------
-// Replay. An assistant reply keeps its content blocks exactly as the API sent
-// them, so thinking blocks and their signatures go back unchanged:
-//   {"prefix":"<hex>","content":[...blocks...],"_tool_call_ids":[...]}
-// `prefix` is the digest of the system prompt, tools and messages that
-// produced the reply ("compaction" when the reply carries a compaction block,
-// whose prefix starts at that block). When the history before the reply has
-// changed since, its thinking blocks would fail the API's preserved-thinking
-// check, so the request leaves them out.
+// Replay. A reply keeps only what fx cannot rebuild from its own copy of the
+// message: its thinking, redacted_thinking and compaction blocks exactly as the
+// API sent them, and where its text and tool_use blocks sat between them:
+//   {"prefix":"<hex>","blocks":[{"type":"thinking",...},{"type":"text","n":12},
+//    {"type":"tool_use","id":"toolu_1"}],"_tool_call_ids":["toolu_1"]}
+// `prefix` is the SHA-256 of the body that produced the reply, up to the end of
+// its last message. Every body starts with system, tools and messages, so those
+// bytes are the history the reply's thinking is bound to. "compaction" marks a
+// reply with a compaction block, whose history starts at that block. When the
+// bytes before a reply differ on a later request, its thinking would fail the
+// API's preserved-thinking check, so the request leaves it out.
 
 const association_field = "_tool_call_ids";
 const compaction_prefix = "compaction";
+/// Ends the messages array in every body this codec writes.
+const messages_end = "],\"model\":";
 
 const Replay = struct {
     prefix: []const u8,
-    content: []const std.json.Value,
+    blocks: []const std.json.Value,
     ids: []const std.json.Value,
 };
 
-/// Values borrow `arena`.
+/// Values borrow `arena`. Also reads the first format, whose text and tool_use
+/// blocks were complete ("content" instead of "blocks").
 fn parseReplay(arena: Allocator, raw: []const u8) Error!Replay {
     if (raw.len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
     if (json_depth.exceeds(raw)) return error.JsonTooDeep;
@@ -327,20 +333,19 @@ fn parseReplay(arena: Allocator, raw: []const u8) Error!Replay {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidProviderState,
     };
-    if (value != .object) return error.InvalidProviderState;
+    if (value != .object or value.object.count() != 3) return error.InvalidProviderState;
     const fields = value.object;
-    if (fields.count() != 3) return error.InvalidProviderState;
     const prefix = fields.get("prefix") orelse return error.InvalidProviderState;
-    const content = fields.get("content") orelse return error.InvalidProviderState;
+    const blocks = fields.get("blocks") orelse fields.get("content") orelse return error.InvalidProviderState;
     const ids = fields.get(association_field) orelse return error.InvalidProviderState;
-    if (prefix != .string or content != .array or ids != .array) return error.InvalidProviderState;
-    for (content.array.items) |block| {
+    if (prefix != .string or blocks != .array or ids != .array) return error.InvalidProviderState;
+    for (blocks.array.items) |block| {
         if (block != .object) return error.InvalidProviderState;
         const kind = block.object.get("type") orelse return error.InvalidProviderState;
         if (kind != .string) return error.InvalidProviderState;
     }
     for (ids.array.items) |id| if (id != .string) return error.InvalidProviderState;
-    return .{ .prefix = prefix.string, .content = content.array.items, .ids = ids.array.items };
+    return .{ .prefix = prefix.string, .blocks = blocks.array.items, .ids = ids.array.items };
 }
 
 fn blockType(block: std.json.Value) []const u8 {
@@ -357,11 +362,17 @@ fn blockString(block: std.json.Value, field: []const u8) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
 
-fn writeReplay(writer: *std.Io.Writer, prefix: []const u8, content: []const std.json.Value, ids: []const []const u8) !void {
+/// The byte length a text block covers in fx's content.
+fn textLength(block: std.json.Value) Error!usize {
+    if (block.object.get("n")) |n| return indexValue(n) catch error.InvalidProviderState;
+    return (blockString(block, "text") orelse return error.InvalidProviderState).len;
+}
+
+fn writeReplay(writer: *std.Io.Writer, prefix: []const u8, blocks: []const std.json.Value, ids: []const []const u8) !void {
     try writer.writeAll("{\"prefix\":");
     try std.json.Stringify.value(prefix, .{}, writer);
-    try writer.writeAll(",\"content\":[");
-    for (content, 0..) |block, index| {
+    try writer.writeAll(",\"blocks\":[");
+    for (blocks, 0..) |block, index| {
         if (index != 0) try writer.writeByte(',');
         try std.json.Stringify.value(block, .{}, writer);
     }
@@ -386,7 +397,7 @@ pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []
     var kept: std.ArrayList(std.json.Value) = .empty;
     var kept_ids: std.ArrayList([]const u8) = .empty;
     var changed = false;
-    for (parsed.content) |block| {
+    for (parsed.blocks) |block| {
         const kind = blockType(block);
         if (std.mem.eql(u8, kind, "text") and !text) {
             changed = true;
@@ -413,25 +424,20 @@ pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []
     return .{ .source = value.source, .parts_json = try out.toOwnedSlice() };
 }
 
+/// The digest a reply to `body` records as its prefix, or null for a body
+/// this codec did not write.
+pub fn bodyPrefix(body: []const u8) ?[32]u8 {
+    const end = std.mem.findLast(u8, body, messages_end) orelse return null;
+    var digest: [32]u8 = undefined;
+    Sha256.hash(body[0..end], &digest, .{});
+    return digest;
+}
+
 // ---------------------------------------------------------------------------
 // Request serialization
 
 /// Pure Messages serialization. Caller owns the returned bytes.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, settings: Settings) Error![]u8 {
-    const rendered = try render(alloc, input, settings);
-    return rendered.body;
-}
-
-/// The digest a reply to `input` records as its prefix.
-pub fn prefixDigest(alloc: Allocator, input: stream_provider.RequestData, settings: Settings) Error![32]u8 {
-    const rendered = try render(alloc, input, settings);
-    alloc.free(rendered.body);
-    return rendered.digest;
-}
-
-const Rendered = struct { body: []u8, digest: [32]u8 };
-
-fn render(alloc: Allocator, input: stream_provider.RequestData, settings: Settings) Error!Rendered {
     try validateRequest(input);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -450,25 +456,22 @@ fn render(alloc: Allocator, input: stream_provider.RequestData, settings: Settin
         else => return error.InvalidToolCallId,
     };
     _ = &projection;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
     var renderer: Renderer = .{
         .arena = arena,
         .request = request,
         .settings = settings,
         .functions = functions.items,
         .projection = &projection,
-        .digest = Sha256.init(.{}),
+        .out = &out,
     };
-    renderer.digest.update("fx-anthropic-prefix-v1");
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    renderer.write(&out.writer) catch |err| switch (err) {
+    renderer.write() catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
         error.InvalidProviderState, error.ReplayTooLarge, error.JsonTooDeep, error.ImageUnavailable, error.InvalidProviderPrompt, error.InvalidToolName => |failure| return failure,
         else => return error.InvalidToolSchema,
     };
-    var digest: [32]u8 = undefined;
-    renderer.digest.final(&digest);
-    return .{ .body = try out.toOwnedSlice(), .digest = digest };
+    return out.toOwnedSlice();
 }
 
 fn toolResultDenied(message: types.ChatMessage) bool {
@@ -476,76 +479,125 @@ fn toolResultDenied(message: types.ChatMessage) bool {
     return failed and tool_result_errors.toolPermissionDenialReason(message.content orelse "") != null;
 }
 
+const Side = enum {
+    user,
+    assistant,
+
+    fn open(side: Side) []const u8 {
+        return switch (side) {
+            .user => "{\"role\":\"user\",\"content\":[",
+            .assistant => "{\"role\":\"assistant\",\"content\":[",
+        };
+    }
+};
+
 const Renderer = struct {
     arena: Allocator,
     request: stream_provider.RequestData,
     settings: Settings,
     functions: []const Function,
     projection: *const tool_call_ids.Projection,
-    digest: Sha256,
+    /// The body. Prefix digests hash its bytes as they are written.
+    out: *std.Io.Writer.Allocating,
+    hasher: Sha256 = .init(.{}),
+    hashed: usize = 0,
+    wire_count: usize = 0,
 
-    fn hashSegment(self: *Renderer, bytes: []const u8) void {
-        var len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len, bytes.len, .little);
-        self.digest.update(&len);
-        self.digest.update(bytes);
+    /// The hasher over every byte written so far.
+    fn synced(self: *Renderer) Sha256 {
+        const written = self.out.written();
+        self.hasher.update(written[self.hashed..]);
+        self.hashed = written.len;
+        return self.hasher;
     }
 
-    fn digestNow(self: *const Renderer) [32]u8 {
-        var copy = self.digest;
-        var out: [32]u8 = undefined;
-        copy.final(&out);
-        return out;
+    /// The prefix digest after the messages written so far, the message
+    /// still open, and a user message of `first` and `second` blocks.
+    fn pendingDigest(self: *Renderer, open: ?Side, body: []const u8, first: ?[]const u8, second: []const u8) [32]u8 {
+        var hasher = self.synced();
+        var count = self.wire_count;
+        if (open) |side| {
+            if (count != 0) hasher.update(",");
+            hasher.update(side.open());
+            hasher.update(body);
+            hasher.update("]}");
+            count += 1;
+        }
+        if (first) |blocks| {
+            if (count != 0) hasher.update(",");
+            hasher.update(Side.user.open());
+            hasher.update(blocks);
+            if (blocks.len != 0 and second.len != 0) hasher.update(",");
+            hasher.update(second);
+            hasher.update("]}");
+        }
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest;
     }
 
-    fn write(self: *Renderer, w: *std.Io.Writer) !void {
+    fn write(self: *Renderer) !void {
+        const w = &self.out.writer;
         const request = self.request;
         const options = self.settings.options;
-        const info = builtinModel(request.model);
-        try w.writeAll("{\"model\":");
+        try w.writeByte('{');
+        try self.writeSystem(w);
+        try self.writeTools(w);
+        try w.writeAll("\"messages\":[");
+        try self.writeMessages(w);
+        // Everything after the messages may change without touching the
+        // history a reply's thinking is bound to.
+        try w.writeAll(messages_end);
         try std.json.Stringify.value(request.model, .{}, w);
+        const info = builtinModel(request.model);
         const limit = request.max_output_tokens orelse if (info) |model| @min(model.max_output_tokens, default_max_tokens) else default_max_tokens;
         try w.print(",\"max_tokens\":{d},\"stream\":true", .{limit});
         if (info != null) {
-            try w.writeAll(",\"thinking\":{\"type\":\"adaptive\"");
-            try w.print(",\"display\":\"{s}\"", .{@tagName(options.thinking_display)});
+            try w.writeAll(",\"thinking\":{\"type\":\"adaptive\",\"display\":\"");
+            try w.writeAll(@tagName(options.thinking_display));
+            try w.writeByte('"');
             if (sendsBlockBinding(options, request.model)) {
-                try w.print(",\"block_binding\":{{\"prefix_mismatch_behavior\":\"{s}\"}}", .{@tagName(options.prefix_mismatch_behavior)});
+                try w.writeAll(",\"block_binding\":{\"prefix_mismatch_behavior\":\"");
+                try w.writeAll(@tagName(options.prefix_mismatch_behavior));
+                try w.writeAll("\"}");
             }
             try w.writeByte('}');
         }
         if (request.provider_options.reasoning) |*effort| {
             const label = effort.label();
-            if (containsName(&efforts, label)) try w.print(",\"output_config\":{{\"effort\":\"{s}\"}}", .{label});
+            if (containsName(&efforts, label)) {
+                try w.writeAll(",\"output_config\":{\"effort\":\"");
+                try w.writeAll(label);
+                try w.writeAll("\"}");
+            }
         }
         if (options.prompt_caching) {
             try w.writeAll(",\"cache_control\":");
             try self.writeCacheControl(w);
         }
         try self.writeContextManagement(w);
-        try self.writeSystem(w);
-        try self.writeTools(w);
-        try w.writeAll(",\"messages\":[");
-        try self.writeMessages(w);
-        try w.writeAll("]}");
+        try self.writeToolChoice(w);
+        try w.writeByte('}');
     }
 
     fn writeCacheControl(self: *const Renderer, w: *std.Io.Writer) !void {
-        try w.writeAll("{\"type\":\"ephemeral\"");
-        if (self.settings.options.cache_ttl == .@"1h") try w.writeAll(",\"ttl\":\"1h\"");
-        try w.writeByte('}');
+        try w.writeAll(if (self.settings.options.cache_ttl == .@"1h") "{\"type\":\"ephemeral\",\"ttl\":\"1h\"}" else "{\"type\":\"ephemeral\"}");
+    }
+
+    fn writeTokens(w: *std.Io.Writer, field: []const u8, kind: []const u8, value: ?u32) !void {
+        const tokens = value orelse return;
+        try w.print(",\"{s}\":{{\"type\":\"{s}\",\"value\":{d}}}", .{ field, kind, tokens });
     }
 
     fn writeContextManagement(self: *const Renderer, w: *std.Io.Writer) !void {
         const options = self.settings.options;
         if (options.compaction == null and options.context_editing == null) return;
         try w.writeAll(",\"context_management\":{\"edits\":[");
-        var wrote = false;
         if (options.context_editing) |editing| {
             try w.writeAll("{\"type\":\"clear_tool_uses_20250919\"");
-            if (editing.trigger_tokens) |tokens| try w.print(",\"trigger\":{{\"type\":\"input_tokens\",\"value\":{d}}}", .{tokens});
-            if (editing.keep_tool_uses) |keep| try w.print(",\"keep\":{{\"type\":\"tool_uses\",\"value\":{d}}}", .{keep});
-            if (editing.clear_at_least_tokens) |tokens| try w.print(",\"clear_at_least\":{{\"type\":\"input_tokens\",\"value\":{d}}}", .{tokens});
+            try writeTokens(w, "trigger", "input_tokens", editing.trigger_tokens);
+            try writeTokens(w, "keep", "tool_uses", editing.keep_tool_uses);
+            try writeTokens(w, "clear_at_least", "input_tokens", editing.clear_at_least_tokens);
             if (editing.clear_tool_inputs) try w.writeAll(",\"clear_tool_inputs\":true");
             if (editing.exclude_tools.len != 0) {
                 try w.writeAll(",\"exclude_tools\":[");
@@ -556,12 +608,11 @@ const Renderer = struct {
                 try w.writeByte(']');
             }
             try w.writeByte('}');
-            wrote = true;
         }
         if (options.compaction) |compaction| {
-            if (wrote) try w.writeByte(',');
+            if (options.context_editing != null) try w.writeByte(',');
             try w.writeAll("{\"type\":\"compact_20260112\"");
-            if (compaction.trigger_tokens) |tokens| try w.print(",\"trigger\":{{\"type\":\"input_tokens\",\"value\":{d}}}", .{tokens});
+            try writeTokens(w, "trigger", "input_tokens", compaction.trigger_tokens);
             if (compaction.instructions) |text| {
                 try w.writeAll(",\"instructions\":");
                 try std.json.Stringify.value(text, .{}, w);
@@ -571,12 +622,7 @@ const Renderer = struct {
         try w.writeAll("]}");
     }
 
-    /// System blocks hash without their cache markers: moving a marker never
-    /// changes the prefix a thinking block is bound to.
     fn writeSystem(self: *Renderer, w: *std.Io.Writer) !void {
-        var scratch: std.Io.Writer.Allocating = .init(self.arena);
-        var count: usize = 0;
-        var markers: usize = 0;
         var last_nonempty: ?usize = null;
         var flagged = false;
         for (self.request.instructions, 0..) |instruction, index| {
@@ -584,23 +630,19 @@ const Renderer = struct {
             last_nonempty = index;
             flagged = flagged or instruction.cache_breakpoint;
         }
-        if (last_nonempty == null) {
-            self.hashSegment("");
-            return;
-        }
-        try w.writeAll(",\"system\":[");
+        const last = last_nonempty orelse return;
+        try w.writeAll("\"system\":[");
+        var count: usize = 0;
+        var markers: usize = 0;
         for (self.request.instructions, 0..) |instruction, index| {
             const text = instruction.content.?;
             if (text.len == 0) continue;
             if (count != 0) try w.writeByte(',');
             count += 1;
-            const start = scratch.written().len;
-            try scratch.writer.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(text, .{}, &scratch.writer);
-            try w.writeAll(scratch.written()[start..]);
-            try scratch.writer.writeByte('}');
+            try w.writeAll("{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(text, .{}, w);
             const marked = self.settings.options.prompt_caching and markers < 2 and
-                (if (flagged) instruction.cache_breakpoint else index == last_nonempty.?);
+                (if (flagged) instruction.cache_breakpoint else index == last);
             if (marked) {
                 markers += 1;
                 try w.writeAll(",\"cache_control\":");
@@ -608,56 +650,50 @@ const Renderer = struct {
             }
             try w.writeByte('}');
         }
-        try w.writeByte(']');
-        self.hashSegment(scratch.written());
+        try w.writeAll("],");
     }
 
     fn writeTools(self: *Renderer, w: *std.Io.Writer) !void {
-        if (self.functions.len == 0) {
-            self.hashSegment("");
-            return;
-        }
-        var scratch: std.Io.Writer.Allocating = .init(self.arena);
-        const s = &scratch.writer;
-        try s.writeByte('[');
+        if (self.functions.len == 0) return;
+        try w.writeAll("\"tools\":[");
         for (self.functions, 0..) |function, index| {
-            if (index != 0) try s.writeByte(',');
-            try s.writeAll("{\"name\":");
-            try writeWireName(s, function.name);
-            try s.writeAll(",\"description\":");
-            try model_tool_schema.writeCappedDescriptionJsonString(self.arena, s, function.description);
-            try s.writeAll(",\"input_schema\":");
+            if (index != 0) try w.writeByte(',');
+            try w.writeAll("{\"name\":");
+            try writeWireName(w, function.name);
+            try w.writeAll(",\"description\":");
+            try model_tool_schema.writeCappedDescriptionJsonString(self.arena, w, function.description);
+            try w.writeAll(",\"input_schema\":");
             // Strict tools need every object schema closed.
             const strict = containsName(self.settings.options.strict_tools, function.name);
             switch (function.schema) {
                 .builtin => |schema| {
                     var sent = schema;
                     if (strict) sent.additional_properties = false;
-                    try model_tool_schema.writeObjectSchema(self.arena, s, sent);
+                    try model_tool_schema.writeObjectSchema(self.arena, w, sent);
                 },
-                .dynamic => |schema| try std.json.Stringify.value(if (strict) try closeObjects(self.arena, schema) else schema, .{}, s),
+                .dynamic => |schema| try std.json.Stringify.value(if (strict) try closeObjects(self.arena, schema) else schema, .{}, w),
             }
-            if (strict) try s.writeAll(",\"strict\":true");
-            try s.writeByte('}');
+            if (strict) try w.writeAll(",\"strict\":true");
+            try w.writeByte('}');
         }
-        try s.writeByte(']');
-        self.hashSegment(scratch.written());
-        try w.writeAll(",\"tools\":");
-        try w.writeAll(scratch.written());
-        try w.writeAll(",\"tool_choice\":{\"type\":");
+        try w.writeAll("],");
+    }
+
+    fn writeToolChoice(self: *const Renderer, w: *std.Io.Writer) !void {
+        if (self.functions.len == 0) return;
         const choice: []const u8 = switch (self.request.tool_choice) {
             .auto => "auto",
             .none => "none",
             .required => if (builtinModel(self.request.model)) |info| (if (info.rejects_forced_tool_choice) "auto" else "any") else "any",
         };
-        try std.json.Stringify.value(choice, .{}, w);
+        try w.writeAll(",\"tool_choice\":{\"type\":\"");
+        try w.writeAll(choice);
+        try w.writeByte('"');
         if (self.request.provider_options.parallel_tool_calls) |parallel| {
             if (!parallel and !std.mem.eql(u8, choice, "none")) try w.writeAll(",\"disable_parallel_tool_use\":true");
         }
         try w.writeByte('}');
     }
-
-    const Side = enum { user, assistant };
 
     /// Index of the newest assistant reply that carries a server compaction
     /// summary. The API ignores everything before that block, so the request
@@ -669,9 +705,9 @@ const Renderer = struct {
             const message = self.request.messages[index];
             if (message.role != .assistant) continue;
             const replay = message.provider_replay orelse continue;
+            if (std.mem.find(u8, replay.parts_json, "\"prefix\":\"" ++ compaction_prefix ++ "\"") == null) continue;
             const parsed = parseReplay(self.arena, replay.parts_json) catch continue;
-            if (!std.mem.eql(u8, parsed.prefix, compaction_prefix)) continue;
-            for (parsed.content) |block| {
+            for (parsed.blocks) |block| {
                 if (!std.mem.eql(u8, blockType(block), "compaction")) continue;
                 const summary = block.object.get("content") orelse continue;
                 if (summary == .string) return index;
@@ -685,31 +721,37 @@ const Renderer = struct {
         const start = try self.compactionStart();
         if (start != 0) debug_trace.logf("gateway", "anthropic_compaction_history_trimmed omitted_messages={d}", .{start});
         var current: ?Side = null;
+        // The open wire message's blocks, one source message's blocks, and
+        // the parts of a user run. Each is reused for every message.
         var body: std.Io.Writer.Allocating = .init(self.arena);
-        var before: [32]u8 = self.digestNow();
-        var wire_count: usize = 0;
+        var blocks: std.Io.Writer.Allocating = .init(self.arena);
+        var kept: std.Io.Writer.Allocating = .init(self.arena);
+        var tail: std.Io.Writer.Allocating = .init(self.arena);
         // User blocks moved behind the reply that follows them; see deferTail.
         var deferred: std.Io.Writer.Allocating = .init(self.arena);
+        var before: [32]u8 = undefined;
         var index = start;
         while (index < messages.len) {
             const message = messages[index];
             const side: Side = if (message.role == .assistant) .assistant else .user;
-            var blocks: std.Io.Writer.Allocating = .init(self.arena);
-            // A reply's prefix is everything before its wire message, so the
-            // open message of the other side counts as already sent.
-            const next_before = if (current == side) before else if (current) |open| try self.digestAfter(&body, open) else self.digestNow();
-            const first_wire = wire_count == 0 and (current == null or current == side);
+            blocks.clearRetainingCapacity();
+            const first_wire = self.wire_count == 0 and (current == null or current == side);
             var consumed: usize = 1;
             switch (side) {
-                .assistant => try self.writeAssistant(&blocks.writer, message, next_before, first_wire),
+                .assistant => {
+                    // A reply's prefix ends with the message before its own.
+                    const prefix = if (current == side) before else self.pendingDigest(current, body.written(), null, "");
+                    try self.writeAssistant(&blocks.writer, message, prefix, first_wire);
+                    if (current != side) before = prefix;
+                },
                 .user => {
-                    var kept: std.Io.Writer.Allocating = .init(self.arena);
-                    var tail: std.Io.Writer.Allocating = .init(self.arena);
+                    kept.clearRetainingCapacity();
+                    tail.clearRetainingCapacity();
                     consumed = try self.writeUserRun(&kept.writer, &tail.writer, messages[index..]);
                     try appendBlocks(&kept, deferred.written());
                     deferred.clearRetainingCapacity();
                     const next = index + consumed;
-                    if (next < messages.len and try self.deferTail(&body, current, kept.written(), tail.written(), messages[next])) {
+                    if (next < messages.len and try self.deferTail(current, body.written(), kept.written(), tail.written(), messages[next])) {
                         try deferred.writer.writeAll(tail.written());
                     } else try appendBlocks(&kept, tail.written());
                     try blocks.writer.writeAll(kept.written());
@@ -718,24 +760,23 @@ const Renderer = struct {
             index += consumed;
             if (blocks.written().len == 0) continue;
             if (current != side) {
-                if (current) |open| try self.flush(w, &body, open, &wire_count);
+                if (current) |open| try self.flush(w, &body, open);
                 current = side;
-                before = next_before;
             } else try body.writer.writeByte(',');
             try body.writer.writeAll(blocks.written());
         }
         if (deferred.written().len != 0) {
-            if (current == .user) try body.writer.writeByte(',') else if (current) |open| try self.flush(w, &body, open, &wire_count);
+            if (current == .user) try body.writer.writeByte(',') else if (current) |open| try self.flush(w, &body, open);
             try body.writer.writeAll(deferred.written());
             current = .user;
         }
-        if (current) |open| try self.flush(w, &body, open, &wire_count);
+        if (current) |open| try self.flush(w, &body, open);
     }
 
-    fn appendBlocks(out: *std.Io.Writer.Allocating, blocks: []const u8) !void {
-        if (blocks.len == 0) return;
+    fn appendBlocks(out: *std.Io.Writer.Allocating, more: []const u8) !void {
+        if (more.len == 0) return;
         if (out.written().len != 0) try out.writer.writeByte(',');
-        try out.writer.writeAll(blocks);
+        try out.writer.writeAll(more);
     }
 
     /// fx adds notes, such as the session's file evidence, to the end of a
@@ -743,54 +784,26 @@ const Renderer = struct {
     /// place, they change the history that reply's thinking is bound to.
     /// Returns true when the reply `next` was produced without `tail`, so
     /// `tail` goes behind the reply instead, where the model first sees it.
-    fn deferTail(self: *Renderer, body: *std.Io.Writer.Allocating, open: ?Side, kept: []const u8, tail: []const u8, next: types.ChatMessage) !bool {
+    fn deferTail(self: *Renderer, open: ?Side, body: []const u8, kept: []const u8, tail: []const u8, next: types.ChatMessage) !bool {
         if (tail.len == 0 or kept.len == 0) return false;
         if (next.role != .assistant or next.tool_calls.len != 0) return false;
         const replay = next.provider_replay orelse return false;
         const parsed = parseReplay(self.arena, replay.parts_json) catch return false;
         if (parsed.prefix.len != 64) return false;
-        var full: std.Io.Writer.Allocating = .init(self.arena);
-        try full.writer.writeAll(kept);
-        try appendBlocks(&full, tail);
-        var hex = std.fmt.bytesToHex(try self.digestWith(body, open, full.written()), .lower);
+        var hex = std.fmt.bytesToHex(self.pendingDigest(open, body, kept, tail), .lower);
         if (std.mem.eql(u8, parsed.prefix, &hex)) return false;
-        hex = std.fmt.bytesToHex(try self.digestWith(body, open, kept), .lower);
+        hex = std.fmt.bytesToHex(self.pendingDigest(open, body, kept, ""), .lower);
         const bound = std.mem.eql(u8, parsed.prefix, &hex);
         if (bound) debug_trace.logf("gateway", "anthropic_user_tail_deferred bytes={d}", .{tail.len});
         return bound;
     }
 
-    fn digestWith(self: *Renderer, body: *std.Io.Writer.Allocating, open: ?Side, user_blocks: []const u8) ![32]u8 {
-        const saved = self.digest;
-        defer self.digest = saved;
-        if (open) |side| self.hashSegment(try self.wireMessage(body, side));
-        var user: std.Io.Writer.Allocating = .init(self.arena);
-        try user.writer.writeAll(user_blocks);
-        self.hashSegment(try self.wireMessage(&user, .user));
-        return self.digestNow();
-    }
-
-    fn wireMessage(self: *Renderer, body: *std.Io.Writer.Allocating, side: Side) ![]const u8 {
-        var message: std.Io.Writer.Allocating = .init(self.arena);
-        try message.writer.print("{{\"role\":\"{s}\",\"content\":[", .{@tagName(side)});
-        try message.writer.writeAll(body.written());
-        try message.writer.writeAll("]}");
-        return message.written();
-    }
-
-    fn digestAfter(self: *Renderer, body: *std.Io.Writer.Allocating, side: Side) ![32]u8 {
-        const saved = self.digest;
-        defer self.digest = saved;
-        self.hashSegment(try self.wireMessage(body, side));
-        return self.digestNow();
-    }
-
-    fn flush(self: *Renderer, w: *std.Io.Writer, body: *std.Io.Writer.Allocating, side: Side, wire_count: *usize) !void {
-        const message = try self.wireMessage(body, side);
-        self.hashSegment(message);
-        if (wire_count.* != 0) try w.writeByte(',');
-        try w.writeAll(message);
-        wire_count.* += 1;
+    fn flush(self: *Renderer, w: *std.Io.Writer, body: *std.Io.Writer.Allocating, side: Side) !void {
+        if (self.wire_count != 0) try w.writeByte(',');
+        try w.writeAll(side.open());
+        try w.writeAll(body.written());
+        try w.writeAll("]}");
+        self.wire_count += 1;
         body.clearRetainingCapacity();
     }
 
@@ -817,6 +830,12 @@ const Renderer = struct {
         wrote.* = true;
     }
 
+    fn writeText(w: *std.Io.Writer, text: []const u8) !void {
+        try w.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(text, .{}, w);
+        try w.writeByte('}');
+    }
+
     fn writeUserBlocks(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, wrote: *bool) !void {
         for (message.images) |image| {
             var snapshot = image_attachments.loadVerifiedSnapshot(self.arena, image, .{}) catch return error.ImageUnavailable;
@@ -827,9 +846,7 @@ const Renderer = struct {
         const text = message.content.?;
         if (text.len != 0) {
             try separator(w, wrote);
-            try w.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(text, .{}, w);
-            try w.writeByte('}');
+            try writeText(w, text);
         }
     }
 
@@ -844,9 +861,7 @@ const Renderer = struct {
             var inner = false;
             if (text.len != 0) {
                 try separator(w, &inner);
-                try w.writeAll("{\"type\":\"text\",\"text\":");
-                try std.json.Stringify.value(text, .{}, w);
-                try w.writeByte('}');
+                try writeText(w, text);
             }
             for (images) |image| {
                 if (image.data.len == 0) continue;
@@ -859,59 +874,82 @@ const Renderer = struct {
         try w.writeByte('}');
     }
 
-    fn writeAssistant(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, before: [32]u8, first_wire: bool) !void {
+    fn writeToolUse(self: *Renderer, w: *std.Io.Writer, call: types.ToolCall) !void {
+        try w.writeAll("{\"type\":\"tool_use\",\"id\":");
+        try std.json.Stringify.value(self.projection.resolve(call.id), .{}, w);
+        try w.writeAll(",\"name\":");
+        try writeWireName(w, call.name);
+        try w.writeAll(",\"input\":");
+        try writeToolInput(self.arena, w, call.arguments_json);
+        try w.writeByte('}');
+    }
+
+    fn writeAssistant(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, prefix: [32]u8, first_wire: bool) !void {
         if (message.provider_replay) |replay| {
-            if (try self.writeReplayed(w, message, replay, before, first_wire)) return;
+            if (try self.writeReplayed(w, message, replay, prefix, first_wire)) return;
         }
         var wrote = false;
         if (message.content) |text| if (text.len != 0) {
             try separator(w, &wrote);
-            try w.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(text, .{}, w);
-            try w.writeByte('}');
+            try writeText(w, text);
         };
         for (message.tool_calls) |call| {
             try separator(w, &wrote);
-            try w.writeAll("{\"type\":\"tool_use\",\"id\":");
-            try std.json.Stringify.value(self.projection.resolve(call.id), .{}, w);
-            try w.writeAll(",\"name\":");
-            try writeWireName(w, call.name);
-            try w.writeAll(",\"input\":");
-            try writeToolInput(self.arena, w, call.arguments_json);
-            try w.writeByte('}');
+            try self.writeToolUse(w, call);
         }
     }
 
-    /// Writes the reply's own blocks when they still describe this message.
-    /// Returns false when the canonical form must be written instead.
-    fn writeReplayed(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, replay: types.ProviderReplay, before: [32]u8, first_wire: bool) !bool {
+    /// Writes the reply's blocks in their order, with text and tool calls
+    /// from fx's message. Returns false when that message no longer matches
+    /// the reply, so the canonical form must be written instead.
+    fn writeReplayed(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, replay: types.ProviderReplay, prefix: [32]u8, first_wire: bool) !bool {
         const parsed = parseReplay(self.arena, replay.parts_json) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidProviderState,
         };
         if (parsed.ids.len != message.tool_calls.len) return error.InvalidProviderState;
         for (parsed.ids, message.tool_calls) |id, call| if (!std.mem.eql(u8, id.string, call.id)) return error.InvalidProviderState;
-        var text: std.ArrayList(u8) = .empty;
-        for (parsed.content) |block| {
+        const content = message.content orelse "";
+        var covered: usize = 0;
+        var texts: usize = 0;
+        for (parsed.blocks) |block| {
             if (!std.mem.eql(u8, blockType(block), "text")) continue;
-            const part = blockString(block, "text") orelse return error.InvalidProviderState;
-            if (part.len == 0) continue;
-            if (text.items.len != 0) try text.appendSlice(self.arena, text_block_separator);
-            try text.appendSlice(self.arena, part);
+            const length = try textLength(block);
+            if (length == 0) continue;
+            if (texts != 0) covered += text_block_separator.len;
+            covered += length;
+            texts += 1;
         }
-        if (!std.mem.eql(u8, text.items, message.content orelse "")) {
+        if (covered != content.len) {
             debug_trace.logf("gateway", "anthropic_replay_text_changed canonical=true", .{});
             return false;
         }
-        var hex = std.fmt.bytesToHex(before, .lower);
+        var hex = std.fmt.bytesToHex(prefix, .lower);
         const bound = if (std.mem.eql(u8, parsed.prefix, compaction_prefix)) first_wire else std.mem.eql(u8, parsed.prefix, &hex);
         if (!bound) debug_trace.logf("gateway", "anthropic_replay_prefix_changed thinking_omitted=true", .{});
         var wrote = false;
-        for (parsed.content) |block| {
-            if (!bound and isThinking(block)) continue;
-            if (std.mem.eql(u8, blockType(block), "text") and (blockString(block, "text") orelse @as([]const u8, "")).len == 0) continue;
-            try separator(w, &wrote);
-            try std.json.Stringify.value(block, .{}, w);
+        var offset: usize = 0;
+        for (parsed.blocks) |block| {
+            const kind = blockType(block);
+            if (std.mem.eql(u8, kind, "text")) {
+                const length = try textLength(block);
+                if (length == 0) continue;
+                if (offset != 0) offset += text_block_separator.len;
+                try separator(w, &wrote);
+                try writeText(w, content[offset..][0..length]);
+                offset += length;
+            } else if (std.mem.eql(u8, kind, "tool_use")) {
+                const id = blockString(block, "id") orelse return error.InvalidProviderState;
+                const call = for (message.tool_calls) |call| {
+                    if (std.mem.eql(u8, call.id, id)) break call;
+                } else return error.InvalidProviderState;
+                try separator(w, &wrote);
+                try self.writeToolUse(w, call);
+            } else {
+                if (!bound and isThinking(block)) continue;
+                try separator(w, &wrote);
+                try std.json.Stringify.value(block, .{}, w);
+            }
         }
         return true;
     }
@@ -920,12 +958,12 @@ const Renderer = struct {
 /// Text blocks of one reply join with this in fx's assistant content.
 pub const text_block_separator = "\n\n";
 
+/// Writes the call's arguments as they are when they are one JSON object,
+/// which is what the model sent; anything else becomes an empty object.
 fn writeToolInput(arena: Allocator, w: *std.Io.Writer, arguments: []const u8) !void {
     const trimmed = std.mem.trim(u8, arguments, " \t\r\n");
-    if (trimmed.len == 0) return w.writeAll("{}");
-    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, trimmed, .{ .parse_numbers = false }) catch return w.writeAll("{}");
-    if (value != .object) return w.writeAll("{}");
-    try std.json.Stringify.value(value, .{}, w);
+    if (trimmed.len < 2 or trimmed[0] != '{' or !(std.json.validate(arena, trimmed) catch false)) return w.writeAll("{}");
+    try w.writeAll(trimmed);
 }
 
 fn writeImageEncoded(w: *std.Io.Writer, media_type: []const u8, base64_data: []const u8) !void {
@@ -1022,14 +1060,14 @@ pub const Reducer = struct {
     phase: enum { waiting, receiving, stopped, closed } = .waiting,
     failure: ?struct { kind: stream_provider.FailureKind, detail: []const u8 } = null,
 
-    /// `prefix` is the digest of the request this reply answers.
-    pub fn init(alloc: Allocator, request: stream_provider.RequestData, prefix: [32]u8, limits: Limits) Error!Reducer {
+    /// `prefix` is the digest of the request this reply answers, from bodyPrefix.
+    pub fn init(alloc: Allocator, request: stream_provider.RequestData, prefix: ?[32]u8, limits: Limits) Error!Reducer {
         var self: Reducer = .{
             .alloc = alloc,
             .arena_state = std.heap.ArenaAllocator.init(alloc),
             .limits = limits,
             .choice = request.tool_choice,
-            .prefix = std.fmt.bytesToHex(prefix, .lower),
+            .prefix = if (prefix) |digest| std.fmt.bytesToHex(digest, .lower) else @splat('0'),
         };
         errdefer self.arena_state.deinit();
         var functions = try selectFunctions(self.arena_state.allocator(), request.tools);
@@ -1303,7 +1341,7 @@ pub const Reducer = struct {
 
         const arena_alloc = self.arena();
         var text: std.ArrayList(u8) = .empty;
-        var content: std.ArrayList(std.json.Value) = .empty;
+        var kept: std.ArrayList(std.json.Value) = .empty;
         var ids: std.ArrayList([]const u8) = .empty;
         var compaction = false;
         for (self.blocks.items) |*block| {
@@ -1311,11 +1349,10 @@ pub const Reducer = struct {
             try fields.put(arena_alloc, "type", .{ .string = @tagName(block.kind) });
             switch (block.kind) {
                 .text => {
-                    if (block.text.items.len != 0) {
-                        if (text.items.len != 0) try text.appendSlice(arena_alloc, text_block_separator);
-                        try text.appendSlice(arena_alloc, block.text.items);
-                    }
-                    try fields.put(arena_alloc, "text", .{ .string = block.text.items });
+                    if (block.text.items.len == 0) continue;
+                    if (text.items.len != 0) try text.appendSlice(arena_alloc, text_block_separator);
+                    try text.appendSlice(arena_alloc, block.text.items);
+                    try fields.put(arena_alloc, "n", .{ .integer = @intCast(block.text.items.len) });
                 },
                 .thinking => {
                     try fields.put(arena_alloc, "thinking", .{ .string = block.text.items });
@@ -1324,10 +1361,6 @@ pub const Reducer = struct {
                 .redacted_thinking => try fields.put(arena_alloc, "data", .{ .string = block.data }),
                 .tool_use => {
                     try fields.put(arena_alloc, "id", .{ .string = block.id });
-                    try fields.put(arena_alloc, "name", .{ .string = block.name });
-                    const input_text = if (block.text.items.len == 0) "{}" else block.text.items;
-                    const input = std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, input_text, .{ .parse_numbers = false }) catch null;
-                    try fields.put(arena_alloc, "input", if (input != null and input.? == .object) input.? else .{ .object = .empty });
                     try ids.append(arena_alloc, block.id);
                 },
                 .compaction => {
@@ -1335,13 +1368,13 @@ pub const Reducer = struct {
                     try fields.put(arena_alloc, "content", if (block.summary_present) .{ .string = block.text.items } else .null);
                 },
             }
-            try content.append(arena_alloc, .{ .object = fields });
+            try kept.append(arena_alloc, .{ .object = fields });
         }
         if (compaction) debug_trace.logf("gateway", "anthropic_server_compaction summary_bytes={d}", .{self.reasoning_bytes});
 
         var state: std.Io.Writer.Allocating = .init(self.alloc);
         defer state.deinit();
-        writeReplay(&state.writer, if (compaction) compaction_prefix else &self.prefix, content.items, ids.items) catch return error.OutOfMemory;
+        writeReplay(&state.writer, if (compaction) compaction_prefix else &self.prefix, kept.items, ids.items) catch return error.OutOfMemory;
         if (state.written().len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
 
         var calls: std.ArrayList(types.ToolCall) = .empty;
@@ -1452,15 +1485,15 @@ pub fn consume_stream(
     alloc: Allocator,
     source: *std.Io.Reader,
     request: stream_provider.RequestData,
-    settings: Settings,
+    /// The body that was sent, from which the reply's prefix comes.
+    body: []const u8,
     limits: Limits,
     events: ?stream_provider.EventSink,
     cancel_flag: *const std.atomic.Value(bool),
     progress: ?sse.Progress,
 ) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const prefix = try prefixDigest(alloc, request, settings);
-    var reducer = try Reducer.init(alloc, request, prefix, limits);
+    var reducer = try Reducer.init(alloc, request, bodyPrefix(body), limits);
     defer reducer.deinit();
     var framing = sse.Reader{ .max_event_bytes = limits.event_bytes, .progress = progress };
     defer framing.deinit(alloc);
@@ -1540,7 +1573,7 @@ test "anthropic request maps system, tools, effort, thinking and caching" {
     try std.testing.expectEqual(@as(i64, 1024), root.get("max_tokens").?.integer);
     try std.testing.expect(root.get("stream").?.bool);
     try std.testing.expect(root.get("temperature") == null and root.get("top_p") == null and root.get("top_k") == null);
-    try expectContains(body, "\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\",\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}}");
+    try expectContains(body, "\"thinking\":{\"type\":\"adaptive\",\"display\":\"omitted\",\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}}");
     try expectContains(body, "\"output_config\":{\"effort\":\"high\"}");
     try expectContains(body, ",\"cache_control\":{\"type\":\"ephemeral\"},");
     const system = root.get("system").?.array.items;
@@ -1653,9 +1686,11 @@ test "anthropic context management and compaction request shape" {
 }
 
 fn testStream(alloc: Allocator, request: stream_provider.RequestData, wire: []const u8, sink: ?stream_provider.EventSink) !stream_provider.Result {
+    const body = try build_request(alloc, request, testSettings(&test_options));
+    defer alloc.free(body);
     var source = std.Io.Reader.fixed(wire);
     var cancel = std.atomic.Value(bool).init(false);
-    return consume_stream(alloc, &source, request, testSettings(&test_options), .{}, sink, &cancel, null);
+    return consume_stream(alloc, &source, request, body, .{}, sink, &cancel, null);
 }
 
 inline fn sseEvent(comptime name: []const u8, comptime data: []const u8) []const u8 {
@@ -1736,7 +1771,9 @@ test "anthropic stream parses thinking, signature, text, tools, usage and keeps 
     const state = completion.provider_state_json.?;
     try expectContains(state, "{\"type\":\"thinking\",\"thinking\":\"Need the file.\",\"signature\":\"c2lnbmVk\"}");
     try expectContains(state, "{\"type\":\"redacted_thinking\",\"data\":\"b3BhcXVl\"}");
-    try expectContains(state, "{\"type\":\"tool_use\",\"id\":\"toolu_A\",\"name\":\"read_file\",\"input\":{\"path\":\"a.txt\"}}");
+    // Text and tool calls come back from fx's own message; the replay keeps
+    // only where they sat.
+    try expectContains(state, "{\"type\":\"text\",\"n\":12},{\"type\":\"tool_use\",\"id\":\"toolu_A\"},{\"type\":\"tool_use\",\"id\":\"toolu_B\"}");
     try expectContains(state, "\"_tool_call_ids\":[\"toolu_A\",\"toolu_B\"]");
 }
 
@@ -1756,7 +1793,7 @@ test "anthropic tool roundtrip replays thinking unchanged and drops it only when
     };
     const second = try build_request(alloc, testRequest("claude-sonnet-5-5", &second_messages), testSettings(&test_options));
     defer alloc.free(second);
-    try expectContains(second, "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Need the file.\",\"signature\":\"c2lnbmVk\"},{\"type\":\"redacted_thinking\",\"data\":\"b3BhcXVl\"},{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"toolu_A\",\"name\":\"read_file\",\"input\":{\"path\":\"a.txt\"}},{\"type\":\"tool_use\",\"id\":\"toolu_B\",\"name\":\"skill__run\",\"input\":{}}]}");
+    try expectContains(second, "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Need the file.\",\"signature\":\"c2lnbmVk\"},{\"type\":\"redacted_thinking\",\"data\":\"b3BhcXVl\"},{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"toolu_A\",\"name\":\"read_file\",\"input\":{\"path\": \"a.txt\"}},{\"type\":\"tool_use\",\"id\":\"toolu_B\",\"name\":\"skill__run\",\"input\":{}}]}");
     try expectContains(second, "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_A\",\"content\":[{\"type\":\"text\",\"text\":\"file a\"}]},{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_B\"");
     // The same history serializes to the same bytes every time.
     const again = try build_request(alloc, testRequest("claude-sonnet-5-5", &second_messages), testSettings(&test_options));
@@ -1943,4 +1980,38 @@ test "anthropic notes fx adds after a turn's final reply move behind it and keep
     defer alloc.free(stripped);
     try std.testing.expect(std.mem.find(u8, stripped, "weigh it") == null);
     try expectContains(stripped, "\"content\":[{\"type\":\"text\",\"text\":\"A\"}]},{\"type\":\"text\",\"text\":\"Session file evidence: a read\"}]}");
+}
+
+test "anthropic thinking survives a change of effort and reads the first replay format" {
+    const alloc = std.testing.allocator;
+    const first_messages = [_]types.ChatMessage{.{ .role = .user, .content = "read a.txt" }};
+    var first_request = testRequest("claude-sonnet-5-5", &first_messages);
+    first_request.provider_options.reasoning = types.ReasoningEffort.literal("low");
+    var result = try testStream(alloc, first_request, test_thinking_tool_stream, null);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    const source: model_provider.ProviderSelection = .{ .provider = test_provider, .model = "claude-sonnet-5-5" };
+    var next = [_]types.ChatMessage{
+        first_messages[0],
+        .{ .role = .assistant, .content = completion.content, .tool_calls = completion.tool_calls, .provider_replay = .{ .source = source, .parts_json = completion.provider_state_json.? } },
+        .{ .role = .tool, .tool_call_id = "toolu_A", .tool_name = "read_file", .content = "file a" },
+        .{ .role = .tool, .tool_call_id = "toolu_B", .tool_name = "skill.run", .content = "ran" },
+    };
+    var raised = testRequest("claude-sonnet-5-5", &next);
+    raised.provider_options.reasoning = types.ReasoningEffort.literal("high");
+    const body = try build_request(alloc, raised, testSettings(&test_options));
+    defer alloc.free(body);
+    try expectContains(body, "\"signature\":\"c2lnbmVk\"");
+    try expectContains(body, "\"output_config\":{\"effort\":\"high\"}");
+
+    // A session saved before the replay kept only thinking stores whole blocks.
+    const first_body = try build_request(alloc, first_request, testSettings(&test_options));
+    defer alloc.free(first_body);
+    const hex = std.fmt.bytesToHex(bodyPrefix(first_body).?, .lower);
+    const legacy = try std.fmt.allocPrint(alloc, "{{\"prefix\":\"{s}\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"Need the file.\",\"signature\":\"c2lnbmVk\"}},{{\"type\":\"text\",\"text\":\"Let me look.\"}},{{\"type\":\"tool_use\",\"id\":\"toolu_A\",\"name\":\"read_file\",\"input\":{{}}}},{{\"type\":\"tool_use\",\"id\":\"toolu_B\",\"name\":\"skill__run\",\"input\":{{}}}}],\"_tool_call_ids\":[\"toolu_A\",\"toolu_B\"]}}", .{&hex});
+    defer alloc.free(legacy);
+    next[1].provider_replay = .{ .source = source, .parts_json = legacy };
+    const legacy_body = try build_request(alloc, testRequest("claude-sonnet-5-5", &next), testSettings(&test_options));
+    defer alloc.free(legacy_body);
+    try expectContains(legacy_body, "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Need the file.\",\"signature\":\"c2lnbmVk\"},{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"toolu_A\"");
 }

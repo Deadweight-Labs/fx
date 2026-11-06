@@ -40,7 +40,9 @@ pub const Options = struct {
     betas: []const []const u8 = &.{},
     prompt_caching: bool = true,
     cache_ttl: CacheTtl = .@"5m",
-    thinking_display: ThinkingDisplay = .summarized,
+    /// `omitted` returns thinking blocks with only their signature, which
+    /// keeps every request that replays them small.
+    thinking_display: ThinkingDisplay = .omitted,
     prefix_mismatch_behavior: PrefixMismatchBehavior = .drop_block,
     compaction: ?Compaction = null,
     context_editing: ?ContextEditing = null,

@@ -9,7 +9,7 @@ export interface FxAnthropicProviderSettings {
   /** Automatic prompt caching. Defaults to true. */
   prompt_caching?: boolean;
   cache_ttl?: "5m" | "1h";
-  /** Defaults to `summarized`. */
+  /** Defaults to `omitted`, which keeps requests small; `summarized` also returns readable reasoning. */
   thinking_display?: "summarized" | "omitted";
   /** What the API does with a thinking block whose history changed. Defaults to `drop_block`. */
   prefix_mismatch_behavior?: "drop_block" | "error" | "unset";

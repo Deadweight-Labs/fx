@@ -72,7 +72,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     var reader: host_stream.HostStreamReader = undefined;
     reader.init(transport, opened.handle, request.cancel_flag, request.deadline, request.cooperative_pulse);
-    const result = anthropic.consume(alloc, definition, &reader.interface, request, null) catch |err| switch (err) {
+    const result = anthropic.consume(alloc, payload, &reader.interface, request, null) catch |err| switch (err) {
         error.ReadFailed => return host_stream.readFailure(&reader, request.cancel_flag),
         else => return err,
     };
