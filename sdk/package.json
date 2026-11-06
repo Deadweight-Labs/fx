@@ -118,6 +118,7 @@
     "grok.js",
     "grok-sign-in.js",
     "custom-provider.js",
+    "anthropic-provider.js",
     "fetch-cleanup.js",
     "mcp.js",
     "skills.js",

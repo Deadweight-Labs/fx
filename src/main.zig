@@ -5289,10 +5289,7 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
-    _ = @import("core/config/anthropic_provider_options.zig");
-    _ = @import("gateway/anthropic_messages_protocol.zig");
     _ = @import("gateway/anthropic_messages.zig");
-    _ = @import("gateway/host_anthropic_messages.zig");
     _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");

@@ -63,11 +63,6 @@ pub const Definition = struct {
     /// Read only by the `anthropic-messages` protocol.
     anthropic: anthropic_options.Options = .{},
 
-    /// Caller owns the returned URL. base_url has no `/v1` for Anthropic.
-    pub fn messages_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/v1/messages" });
-    }
-
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
         return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });

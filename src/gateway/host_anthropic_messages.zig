@@ -47,7 +47,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const payload = request.prepared_request_body orelse
         try anthropic.build_for(definition, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
-    const endpoint = try definition.messages_url(alloc);
+    const endpoint = try anthropic.messagesUrl(definition, alloc);
     defer alloc.free(endpoint);
     const beta = try codec.betaHeader(alloc, &definition.anthropic, request.model);
     defer if (beta) |value| alloc.free(value);

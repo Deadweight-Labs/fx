@@ -25,6 +25,25 @@ const Allocator = std.mem.Allocator;
 /// The cheapest current model, for session titles.
 const title_model = "claude-haiku-5-5";
 
+/// The bundle for any configured provider, by its protocol.
+pub fn configuredBundle(definition: *const definitions.Definition) provider_set.Bundle {
+    return switch (definition.protocol) {
+        .@"openai-chat-completions" => @import("chat_completions.zig").bundle(definition),
+        .@"anthropic-messages" => bundle(definition),
+    };
+}
+
+/// Caller owns the returned URL. base_url has no `/v1`.
+pub fn messagesUrl(definition: *const definitions.Definition, alloc: Allocator) Allocator.Error![]u8 {
+    return std.mem.concat(alloc, u8, &.{ definition.base_url, "/v1/messages" });
+}
+
+test {
+    _ = @import("anthropic_messages_protocol.zig");
+    _ = @import("host_anthropic_messages.zig");
+    _ = @import("../core/config/anthropic_provider_options.zig");
+}
+
 /// Every callback borrows the immutable definition from the owning profile runtime.
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
@@ -121,7 +140,7 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 }
 
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
-    const url = try definition.messages_url(alloc);
+    const url = try messagesUrl(definition, alloc);
     defer alloc.free(url);
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;

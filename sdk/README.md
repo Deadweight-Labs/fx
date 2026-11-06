@@ -397,20 +397,6 @@ Requests go to `{baseUrl}/chat/completions`, which must use HTTPS, or HTTP on `l
 
 Saved sessions follow the agent's provider: point an agent at another base URL and its sessions continue there, history included.
 
-A custom provider can also speak the Anthropic Messages API, with your own Anthropic API key:
-
-```js
-const claude = { name: "claude", protocol: "anthropic-messages" };
-
-const agent = createFxAgent({
-  provider: claude,
-  model: "claude-sonnet-5-5",
-  credentials: async () => ({ apiKey: process.env.ANTHROPIC_API_KEY }),
-});
-```
-
-Requests go to `{baseUrl}/v1/messages`, where `baseUrl` defaults to `https://api.anthropic.com`, and the key travels in the `x-api-key` header. libfx knows `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` without `models`. Thinking blocks go back to the API unchanged, with their signatures. `anthropic` takes the CLI's settings for this protocol, such as `{ compaction: { trigger_tokens: 150000 } }` for server-side compaction or `{ prompt_caching: false }`; `FxAnthropicProviderSettings` lists them.
-
 ### Where credentials go
 
 libfx adds ChatGPT, Grok and custom-provider credentials to each request in JavaScript, just before it's sent, and sends them only to that provider. They never reach the engine. No credential is written to a saved session or passed to `onEvent`, and if a server quotes a key or token back in an error, libfx masks it before the error reaches the turn.

@@ -58,8 +58,9 @@ const answer = sse(
   customProviderSpec(definition, () => "s").authorize(headers, messagesUrl, { accessToken: "sk-ant" });
   assert.equal(headers.get("x-api-key"), "sk-ant");
   assert.equal(headers.get("authorization"), null);
-  assert.throws(() => customProviderDefinition({ name: "x", anthropic: {} }), /anthropic-messages protocol only/);
-  assert.throws(() => customProviderDefinition({ name: "x", protocol: "responses" }), /provider.protocol/);
+  assert.throws(() => customProviderDefinition({ name: "x", baseUrl: "https://a.example", anthropic: {} }), /unknown field anthropic/);
+  assert.throws(() => customProviderDefinition({ name: "x", baseUrl: "https://a.example", protocol: "responses" }), /unknown field protocol/);
+  assert.throws(() => customProviderDefinition({ name: "gateway", protocol: "anthropic-messages" }), /provider.name/);
 }
 
 // 2. A tool round trip on the host's key replays the thinking block.
