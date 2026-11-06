@@ -410,7 +410,7 @@ test "anthropic catalog lists built-in models with effort levels and keeps decla
 test "anthropic headers carry the version and only the betas the settings need" {
     const alloc = std.testing.allocator;
     var registry = try definitions.Registry.parse_json(alloc,
-        \\{"claude":{"protocol":"anthropic-messages","anthropic":{"version":"2026-10-21","betas":["extra-1"],"compaction":{},"context_editing":{}}}}
+        \\{"claude":{"protocol":"anthropic-messages","anthropic":{"version":"2026-10-21","betas":["extra-1"],"context_management":{"edits":[{"type":"clear_thinking_20251015"},{"type":"compact_20260112"}]}}}}
     );
     defer registry.deinit(alloc);
     const definition = registry.get("claude").?;

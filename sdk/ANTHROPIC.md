@@ -14,7 +14,11 @@ const agent = createFxAgent({
 
 Requests go to `{baseUrl}/v1/messages`, where `baseUrl` defaults to `https://api.anthropic.com`, and the key travels in the `x-api-key` header. libfx knows `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` without `models`. Thinking blocks go back to the API unchanged, with their signatures.
 
-`anthropic` takes the CLI's settings for this protocol, such as `{ cache_ttl: "1h" }`, `{ compaction: { trigger_tokens: 150000 } }` for server-side compaction, or `{ prompt_caching: false }`. `FxAnthropicProviderSettings` in `types/anthropic-provider.d.cts` lists them.
+`anthropic` takes the CLI's settings for this protocol, such as `{ cache_ttl: "1h" }` or `{ prompt_caching: false }`. `FxAnthropicProviderSettings` in `types/anthropic-provider.d.cts` lists them. Server-side compaction and context editing go in `context_management`, in the API's own terms, and libfx adds their beta headers:
+
+```js
+anthropic: { context_management: { edits: [{ type: "compact_20260112", trigger: { type: "input_tokens", value: 150000 } }] } }
+```
 
 In the fx CLI, the same provider is a `providers` entry in `~/.fx/settings.json`:
 

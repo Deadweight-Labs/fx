@@ -128,10 +128,14 @@ pub const Settings = struct {
 pub fn betaHeader(alloc: Allocator, options: *const Options, model: []const u8) Allocator.Error!?[]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    for (options.betas) |beta| try appendBeta(alloc, &out, beta);
+    var listed = std.mem.splitScalar(u8, options.betas, ',');
+    while (listed.next()) |beta| if (beta.len != 0) try appendBeta(alloc, &out, beta);
     if (sendsBlockBinding(options, model)) try appendBeta(alloc, &out, thinking_binding_beta);
-    if (options.compaction != null) try appendBeta(alloc, &out, compaction_beta);
-    if (options.context_editing != null) try appendBeta(alloc, &out, context_management_beta);
+    // The edits in `context_management` each need their beta.
+    if (options.context_management) |edits| {
+        if (std.mem.find(u8, edits, "\"compact_") != null) try appendBeta(alloc, &out, compaction_beta);
+        if (std.mem.find(u8, edits, "\"clear_") != null) try appendBeta(alloc, &out, context_management_beta);
+    }
     if (out.items.len == 0) return null;
     return try out.toOwnedSlice(alloc);
 }
@@ -193,13 +197,8 @@ fn containsName(names: []const []const u8, name: []const u8) bool {
 
 fn appendFunction(alloc: Allocator, functions: *std.ArrayList(Function), function: Function) Error!void {
     try validateName(function.name);
-    var buffer: [2 * max_name_bytes]u8 = undefined;
-    const wire = try wireName(&buffer, function.name);
     if (functions.items.len == max_selected_tools) return error.TooManyTools;
-    for (functions.items) |prior| {
-        var prior_buffer: [2 * max_name_bytes]u8 = undefined;
-        if (std.mem.eql(u8, try wireName(&prior_buffer, prior.name), wire)) return error.InvalidToolSelection;
-    }
+    for (functions.items) |prior| if (std.mem.eql(u8, prior.name, function.name)) return error.InvalidToolSelection;
     try functions.append(alloc, function);
 }
 
@@ -238,28 +237,6 @@ fn checkSchemaDepth(value: std.json.Value, depth: usize) Error!void {
         .array => |items| for (items.items) |child| try checkSchemaDepth(child, depth + 1),
         .float => |number| if (!std.math.isFinite(number)) return error.InvalidToolSchema,
         else => {},
-    }
-}
-
-/// A copy of `schema` with `additionalProperties: false` on every object
-/// schema that does not set it.
-fn closeObjects(arena: Allocator, schema: std.json.Value) Allocator.Error!std.json.Value {
-    switch (schema) {
-        .object => |fields| {
-            var copy: std.json.ObjectMap = .empty;
-            var iterator = fields.iterator();
-            while (iterator.next()) |entry| try copy.put(arena, entry.key_ptr.*, try closeObjects(arena, entry.value_ptr.*));
-            const kind = fields.get("type");
-            const is_object = kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "object");
-            if (is_object and !fields.contains("additionalProperties")) try copy.put(arena, "additionalProperties", .{ .bool = false });
-            return .{ .object = copy };
-        },
-        .array => |items| {
-            var copy = std.json.Array.init(arena);
-            for (items.items) |item| try copy.append(try closeObjects(arena, item));
-            return .{ .array = copy };
-        },
-        else => return schema,
     }
 }
 
@@ -594,42 +571,10 @@ const Renderer = struct {
         try w.writeAll(if (self.settings.options.cache_ttl == .@"1h") "{\"type\":\"ephemeral\",\"ttl\":\"1h\"}" else "{\"type\":\"ephemeral\"}");
     }
 
-    fn writeTokens(w: *std.Io.Writer, field: []const u8, kind: []const u8, value: ?u32) !void {
-        const tokens = value orelse return;
-        try w.print(",\"{s}\":{{\"type\":\"{s}\",\"value\":{d}}}", .{ field, kind, tokens });
-    }
-
     fn writeContextManagement(self: *const Renderer, w: *std.Io.Writer) !void {
-        const options = self.settings.options;
-        if (options.compaction == null and options.context_editing == null) return;
-        try w.writeAll(",\"context_management\":{\"edits\":[");
-        if (options.context_editing) |editing| {
-            try w.writeAll("{\"type\":\"clear_tool_uses_20250919\"");
-            try writeTokens(w, "trigger", "input_tokens", editing.trigger_tokens);
-            try writeTokens(w, "keep", "tool_uses", editing.keep_tool_uses);
-            try writeTokens(w, "clear_at_least", "input_tokens", editing.clear_at_least_tokens);
-            if (editing.clear_tool_inputs) try w.writeAll(",\"clear_tool_inputs\":true");
-            if (editing.exclude_tools.len != 0) {
-                try w.writeAll(",\"exclude_tools\":[");
-                for (editing.exclude_tools, 0..) |name, index| {
-                    if (index != 0) try w.writeByte(',');
-                    try writeWireName(w, name);
-                }
-                try w.writeByte(']');
-            }
-            try w.writeByte('}');
-        }
-        if (options.compaction) |compaction| {
-            if (options.context_editing != null) try w.writeByte(',');
-            try w.writeAll("{\"type\":\"compact_20260112\"");
-            try writeTokens(w, "trigger", "input_tokens", compaction.trigger_tokens);
-            if (compaction.instructions) |text| {
-                try w.writeAll(",\"instructions\":");
-                try std.json.Stringify.value(text, .{}, w);
-            }
-            try w.writeByte('}');
-        }
-        try w.writeAll("]}");
+        const edits = self.settings.options.context_management orelse return;
+        try w.writeAll(",\"context_management\":");
+        try w.writeAll(edits);
     }
 
     fn writeSystem(self: *Renderer, w: *std.Io.Writer) !void {
@@ -673,15 +618,20 @@ const Renderer = struct {
             try w.writeAll(",\"description\":");
             try model_tool_schema.writeCappedDescriptionJsonString(self.arena, w, function.description);
             try w.writeAll(",\"input_schema\":");
-            // Strict tools need every object schema closed.
-            const strict = containsName(self.settings.options.strict_tools, function.name);
+            // A strict tool needs its object schema closed. fx closes its own
+            // tools' schemas; another tool is strict only when it already is.
+            var strict = Options.listed(self.settings.options.strict_tools, function.name);
             switch (function.schema) {
                 .builtin => |schema| {
                     var sent = schema;
                     if (strict) sent.additional_properties = false;
                     try model_tool_schema.writeObjectSchema(self.arena, w, sent);
                 },
-                .dynamic => |schema| try std.json.Stringify.value(if (strict) try closeObjects(self.arena, schema) else schema, .{}, w),
+                .dynamic => |schema| {
+                    const closed = schema.object.get("additionalProperties");
+                    strict = strict and closed != null and closed.? == .bool and !closed.?.bool;
+                    try std.json.Stringify.value(schema, .{}, w);
+                },
             }
             if (strict) try w.writeAll(",\"strict\":true");
             try w.writeByte('}');
@@ -923,10 +873,7 @@ const Renderer = struct {
             'u' => {},
             else => return false,
         };
-        if (covered != content.len or stored != parsed.blocks.len) {
-            debug_trace.logf("gateway", "anthropic_replay_text_changed canonical=true", .{});
-            return false;
-        }
+        if (covered != content.len or stored != parsed.blocks.len) return false;
         // Hashing the history is needed only for a reply with thinking.
         const bound = if (std.mem.eql(u8, parsed.prefix, compaction_prefix))
             first_wire
@@ -1151,7 +1098,6 @@ pub const Reducer = struct {
                 if (nonNull(delta, "stop_details")) |details| self.stop_details = try std.json.Stringify.valueAlloc(self.arena(), details, .{});
             }
             if (nonNull(root, "usage")) |usage| try self.acceptUsage(usage);
-            if (nonNull(root, "context_management") != null) debug_trace.logf("gateway", "anthropic_context_management_applied", .{});
             return .{};
         }
         if (std.mem.eql(u8, kind, "message_stop")) {
@@ -1313,9 +1259,6 @@ pub const Reducer = struct {
         if (nonNull(fields, "output_tokens_details")) |details| {
             if (try tokenCount(try object(details), "thinking_tokens")) |count| self.usage.thinking = count;
         }
-        if (nonNull(fields, "iterations")) |iterations| if (iterations == .array) {
-            debug_trace.logf("gateway", "anthropic_usage_iterations count={d}", .{iterations.array.items.len});
-        };
     }
 
     fn finalUsage(self: *const Reducer) types.Usage {
@@ -1329,8 +1272,8 @@ pub const Reducer = struct {
         return .{ .input_tokens = input, .output_tokens = usage.output, .cache_read_tokens = usage.cache_read, .cache_write_tokens = usage.cache_write, .reasoning_tokens = usage.thinking };
     }
 
-    /// The reply's replay text; null when its tool call ids cannot be stored.
-    /// Caller owns the result.
+    /// The reply's replay text, in the reducer's arena; null when its tool
+    /// call ids cannot be stored.
     fn replayState(self: *Reducer) (Error || std.Io.Writer.Error)!?[]u8 {
         const arena_alloc = self.arena();
         var layout: std.Io.Writer.Allocating = .init(arena_alloc);
@@ -1384,7 +1327,7 @@ pub const Reducer = struct {
         // Without thinking or compaction there is nothing fx's own message
         // cannot rebuild, so the reply goes back in its canonical form.
         if (!replayable or stored.written().len == 0) return null;
-        return try std.mem.concat(self.alloc, u8, &.{ replay_magic, prefix, "\n", layout.written(), "\n", stored.written() });
+        return try std.mem.concat(arena_alloc, u8, &.{ replay_magic, prefix, "\n", layout.written(), "\n", stored.written() });
     }
 
     /// The reply as fx keeps it. A stream that ended in an `error` event is a
@@ -1415,49 +1358,24 @@ pub const Reducer = struct {
             error.WriteFailed => return error.OutOfMemory,
             else => |failure| return failure,
         };
-        errdefer if (provider_state) |state| self.alloc.free(state);
-
         var calls: std.ArrayList(types.ToolCall) = .empty;
-        errdefer {
-            for (calls.items) |call| {
-                self.alloc.free(call.id);
-                self.alloc.free(call.name);
-                self.alloc.free(call.arguments_json);
-            }
-            calls.deinit(self.alloc);
-        }
         for (self.blocks.items) |block| {
             if (block.kind != .tool_use) continue;
-            const id = try self.alloc.dupe(u8, block.id);
-            errdefer self.alloc.free(id);
-            const name = try self.alloc.dupe(u8, originalName(self.functions, block.name));
-            errdefer self.alloc.free(name);
-            const arguments = try self.alloc.dupe(u8, if (block.text.items.len == 0) "{}" else block.text.items);
-            errdefer self.alloc.free(arguments);
-            try calls.append(self.alloc, .{ .id = id, .name = name, .arguments_json = arguments });
+            try calls.append(arena_alloc, .{ .id = block.id, .name = originalName(self.functions, block.name), .arguments_json = if (block.text.items.len == 0) "{}" else block.text.items });
         }
-        const owned_text = if (text.items.len != 0) try self.alloc.dupe(u8, text.items) else null;
-        errdefer if (owned_text) |value| self.alloc.free(value);
-        const generation_id = if (self.message_id) |id| try self.alloc.dupe(u8, id) else null;
-        errdefer if (generation_id) |id| self.alloc.free(id);
-        const failure_detail = if (self.stop_details) |details| try self.alloc.dupe(u8, details) else null;
-        errdefer if (failure_detail) |detail| self.alloc.free(detail);
-        const owned_calls = try calls.toOwnedSlice(self.alloc);
-        errdefer types.freeToolCallSlice(self.alloc, owned_calls);
         self.phase = .closed;
-        return .{ .completed = .{
-            .completion = .{
-                .content = owned_text,
-                .tool_calls = owned_calls,
-                .generation_id = generation_id,
-                .provider_state_json = provider_state,
-                .provider_failure_detail = failure_detail,
-                .finish_reason = reason,
-                .finish_reason_raw = .init(raw),
-                .usage = self.finalUsage(),
-            },
-            .ownership = .owned,
-        } };
+        // Everything above lives in the reducer's arena; the result owns copies.
+        const borrowed: stream_provider.Result = .{ .completed = .{ .completion = .{
+            .content = if (text.items.len != 0) text.items else null,
+            .tool_calls = calls.items,
+            .generation_id = self.message_id,
+            .provider_state_json = provider_state,
+            .provider_failure_detail = self.stop_details,
+            .finish_reason = reason,
+            .finish_reason_raw = .init(raw),
+            .usage = self.finalUsage(),
+        } } };
+        return borrowed.dupe(self.alloc);
     }
 };
 
@@ -1607,7 +1525,7 @@ test "anthropic request maps system, tools, effort, thinking and caching" {
     var request = testRequest("claude-haiku-5-5", &.{.{ .role = .user, .content = "hello" }});
     request.provider_options.reasoning = types.ReasoningEffort.literal("high");
     request.provider_options.parallel_tool_calls = false;
-    var options: Options = .{ .strict_tools = &.{"read_file"} };
+    var options: Options = .{ .strict_tools = "read_file" };
     const body = try build_request(alloc, request, testSettings(&options));
     defer alloc.free(body);
     var parsed = try parseBody(alloc, body);
@@ -1718,15 +1636,16 @@ test "anthropic user images become base64 image blocks before the text" {
     try expectContains(body, "\"}},{\"type\":\"text\",\"text\":\"what color?\"}");
 }
 
-test "anthropic context management and compaction request shape" {
+test "anthropic context management goes out as configured, with its betas" {
     const alloc = std.testing.allocator;
-    var options: Options = .{
-        .compaction = .{ .trigger_tokens = 50_000, .instructions = "Keep open tasks." },
-        .context_editing = .{ .trigger_tokens = 3000, .keep_tool_uses = 1, .clear_at_least_tokens = 100, .exclude_tools = &.{"skill.run"} },
-    };
+    const edits = "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"keep\":{\"type\":\"tool_uses\",\"value\":1}},{\"type\":\"compact_20260112\",\"instructions\":\"Keep open tasks.\"}]}";
+    var options: Options = .{ .context_management = edits };
     const body = try build_request(alloc, testRequest("claude-haiku-5-5", &.{.{ .role = .user, .content = "x" }}), testSettings(&options));
     defer alloc.free(body);
-    try expectContains(body, "\"context_management\":{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"input_tokens\",\"value\":3000},\"keep\":{\"type\":\"tool_uses\",\"value\":1},\"clear_at_least\":{\"type\":\"input_tokens\",\"value\":100},\"exclude_tools\":[\"skill__run\"]},{\"type\":\"compact_20260112\",\"trigger\":{\"type\":\"input_tokens\",\"value\":50000},\"instructions\":\"Keep open tasks.\"}]}");
+    try expectContains(body, ",\"context_management\":" ++ edits);
+    const beta = (try betaHeader(alloc, &options, "claude-haiku-5-5")).?;
+    defer alloc.free(beta);
+    try std.testing.expectEqualStrings(thinking_binding_beta ++ "," ++ compaction_beta ++ "," ++ context_management_beta, beta);
 }
 
 fn testStream(alloc: Allocator, request: stream_provider.RequestData, wire: []const u8, sink: ?stream_provider.EventSink) !stream_provider.Result {

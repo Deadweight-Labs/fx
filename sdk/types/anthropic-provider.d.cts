@@ -13,11 +13,13 @@ export interface FxAnthropicProviderSettings {
   thinking_display?: "summarized" | "omitted";
   /** What the API does with a thinking block whose history changed. Defaults to `drop_block`. */
   prefix_mismatch_behavior?: "drop_block" | "error" | "unset";
-  /** Server-side compaction (beta). The trigger is at least 50,000 input tokens. */
-  compaction?: { trigger_tokens?: number; instructions?: string };
-  /** Server-side clearing of old tool results (beta). */
-  context_editing?: { trigger_tokens?: number; keep_tool_uses?: number; clear_at_least_tokens?: number; clear_tool_inputs?: boolean; exclude_tools?: string[] };
-  /** Tools sent with `strict: true`. */
+  /**
+   * The request's `context_management` object in the API's own terms, sent as it is: server-side
+   * compaction (`compact_20260112`) and context editing (`clear_tool_uses_20250919`, ...). The
+   * matching beta headers are added. Tool names in it use the API's names, with `__` for each dot.
+   */
+  context_management?: { edits: Array<Record<string, unknown>> };
+  /** Tools sent with `strict: true`: fx's own tools, and others whose schema already sets `additionalProperties: false`. */
   strict_tools?: string[];
 }
 

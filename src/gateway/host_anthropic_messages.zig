@@ -86,7 +86,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 const FakeTransport = @import("host_transport_testing.zig").FakeTransport;
 
 const test_provider =
-    \\{"claude":{"protocol":"anthropic-messages","auth":{"type":"none"},"anthropic":{"compaction":{}}}}
+    \\{"claude":{"protocol":"anthropic-messages","auth":{"type":"none"},"anthropic":{"context_management":{"edits":[{"type":"compact_20260112"}]}}}}
 ;
 
 const reply_sse =
