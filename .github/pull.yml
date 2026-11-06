@@ -1,0 +1,14 @@
+# Pull app (https://github.com/apps/pull): brings vercel-labs/fx main into
+# this fork's main. Without this file the app would hard reset main to
+# upstream and drop the fork's own commits, so it merges instead. A clean
+# update merges by itself; one with a conflict stays open for a person.
+version: "1"
+rules:
+  - base: main
+    upstream: vercel-labs:main
+    mergeMethod: merge
+    mergeUnstable: false
+    conflictReviewers:
+      - Eightsheet
+label: ":arrow_heading_down: pull"
+conflictLabel: "merge-conflict"
