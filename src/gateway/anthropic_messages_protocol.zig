@@ -1516,10 +1516,8 @@ fn testRequest(model: []const u8, messages: []const types.ChatMessage) stream_pr
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
-    if (std.mem.find(u8, haystack, needle) == null) {
-        std.debug.print("\nmissing: {s}\nin: {s}\n", .{ needle, haystack });
-        return error.TestExpectedContains;
-    }
+    // The testing helper prints both strings when they differ.
+    if (std.mem.find(u8, haystack, needle) == null) try std.testing.expectEqualStrings(needle, haystack);
 }
 
 fn parseBody(alloc: Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
