@@ -17,7 +17,29 @@ const json_depth = @import("json_depth.zig");
 const sse = @import("sse.zig");
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// Tells whether the history before a reply changed: two 64-bit Wyhash
+/// lanes, fast enough to run over every body. Not a security boundary; the API
+/// checks the signatures itself.
+const PrefixHash = struct {
+    a: std.hash.Wyhash = .init(0x66786132),
+    b: std.hash.Wyhash = .init(0x70726566),
+
+    fn update(self: *PrefixHash, bytes: []const u8) void {
+        self.a.update(bytes);
+        self.b.update(bytes);
+    }
+
+    fn final(self: PrefixHash) Digest {
+        var copy = self;
+        var digest: Digest = undefined;
+        std.mem.writeInt(u64, digest[0..8], copy.a.final(), .little);
+        std.mem.writeInt(u64, digest[8..16], copy.b.final(), .little);
+        return digest;
+    }
+};
+const Digest = [16]u8;
+const digest_hex_len = 2 * @sizeOf(Digest);
 
 pub const Options = anthropic_options.Options;
 
@@ -302,86 +324,70 @@ fn validateHistory(alloc: Allocator, messages: []const types.ChatMessage) Error!
 
 // ---------------------------------------------------------------------------
 // Replay. A reply keeps only what fx cannot rebuild from its own copy of the
-// message: its thinking, redacted_thinking and compaction blocks exactly as the
-// API sent them, and where its text and tool_use blocks sat between them:
-//   {"prefix":"<hex>","blocks":[{"type":"thinking",...},{"type":"text","n":12},
-//    {"type":"tool_use","id":"toolu_1"}],"_tool_call_ids":["toolu_1"]}
-// `prefix` is the SHA-256 of the body that produced the reply, up to the end of
-// its last message. Every body starts with system, tools and messages, so those
-// bytes are the history the reply's thinking is bound to. "compaction" marks a
-// reply with a compaction block, whose history starts at that block. When the
-// bytes before a reply differ on a later request, its thinking would fail the
-// API's preserved-thinking check, so the request leaves it out.
+// message: its thinking, redacted_thinking and compaction blocks, serialized
+// once so every later request copies them unchanged, and where its text and
+// tool_use blocks sat between them. The text needs no JSON parser to read:
+//   fxa1 <prefix>\n<layout>\n<blocks>
+// `layout` lists the reply's blocks in order: `t<bytes>` a text block of fx's
+// content, `u<id>` a tool call, `k<bytes>` a thinking or redacted_thinking
+// block and `c<bytes>` a compaction block in `blocks` (`C` when it holds a
+// summary). `prefix` is the SHA-256 of the body that produced the reply, up to
+// the end of its last message, in hex. Every body starts with system, tools
+// and messages, so those bytes are the history the reply's thinking is bound
+// to. `compaction` marks a reply with a summary, whose history starts at that
+// block. When the bytes before a reply differ on a later request, its thinking
+// would fail the API's preserved-thinking check, so the request leaves it out.
 
-const association_field = "_tool_call_ids";
+const replay_magic = "fxa1 ";
 const compaction_prefix = "compaction";
 /// Ends the messages array in every body this codec writes.
 const messages_end = "],\"model\":";
 
 const Replay = struct {
     prefix: []const u8,
-    blocks: []const std.json.Value,
-    ids: []const std.json.Value,
+    layout: []const u8,
+    blocks: []const u8,
+
+    /// Null for text this codec did not write, such as an earlier format.
+    fn parse(raw: []const u8) ?Replay {
+        if (!std.mem.startsWith(u8, raw, replay_magic)) return null;
+        const head_end = std.mem.findScalar(u8, raw, '\n') orelse return null;
+        const layout_end = head_end + 1 + (std.mem.findScalar(u8, raw[head_end + 1 ..], '\n') orelse return null);
+        return .{ .prefix = raw[replay_magic.len..head_end], .layout = raw[head_end + 1 .. layout_end], .blocks = raw[layout_end + 1 ..] };
+    }
+
+    fn entries(self: Replay) std.mem.TokenIterator(u8, .scalar) {
+        return std.mem.tokenizeScalar(u8, self.layout, ' ');
+    }
+
+    /// Whether the tool calls the layout names are `calls`, in order.
+    fn matchesCalls(self: Replay, calls: []const types.ToolCall) bool {
+        var it = self.entries();
+        var index: usize = 0;
+        while (it.next()) |entry| {
+            if (entry[0] != 'u') continue;
+            if (index == calls.len or !std.mem.eql(u8, entry[1..], calls[index].id)) return false;
+            index += 1;
+        }
+        return index == calls.len;
+    }
+
+    fn hasThinking(self: Replay) bool {
+        var it = self.entries();
+        while (it.next()) |entry| if (entry[0] == 'k') return true;
+        return false;
+    }
+
+    fn summarizes(self: Replay) bool {
+        if (!std.mem.eql(u8, self.prefix, compaction_prefix)) return false;
+        var it = self.entries();
+        while (it.next()) |entry| if (entry[0] == 'C') return true;
+        return false;
+    }
 };
 
-/// Values borrow `arena`. Also reads the first format, whose text and tool_use
-/// blocks were complete ("content" instead of "blocks").
-fn parseReplay(arena: Allocator, raw: []const u8) Error!Replay {
-    if (raw.len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
-    if (json_depth.exceeds(raw)) return error.JsonTooDeep;
-    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidProviderState,
-    };
-    if (value != .object or value.object.count() != 3) return error.InvalidProviderState;
-    const fields = value.object;
-    const prefix = fields.get("prefix") orelse return error.InvalidProviderState;
-    const blocks = fields.get("blocks") orelse fields.get("content") orelse return error.InvalidProviderState;
-    const ids = fields.get(association_field) orelse return error.InvalidProviderState;
-    if (prefix != .string or blocks != .array or ids != .array) return error.InvalidProviderState;
-    for (blocks.array.items) |block| {
-        if (block != .object) return error.InvalidProviderState;
-        const kind = block.object.get("type") orelse return error.InvalidProviderState;
-        if (kind != .string) return error.InvalidProviderState;
-    }
-    for (ids.array.items) |id| if (id != .string) return error.InvalidProviderState;
-    return .{ .prefix = prefix.string, .blocks = blocks.array.items, .ids = ids.array.items };
-}
-
-fn blockType(block: std.json.Value) []const u8 {
-    return block.object.get("type").?.string;
-}
-
-fn isThinking(block: std.json.Value) bool {
-    const kind = blockType(block);
-    return std.mem.eql(u8, kind, "thinking") or std.mem.eql(u8, kind, "redacted_thinking");
-}
-
-fn blockString(block: std.json.Value, field: []const u8) ?[]const u8 {
-    const value = block.object.get(field) orelse return null;
-    return if (value == .string) value.string else null;
-}
-
-/// The byte length a text block covers in fx's content.
-fn textLength(block: std.json.Value) Error!usize {
-    if (block.object.get("n")) |n| return indexValue(n) catch error.InvalidProviderState;
-    return (blockString(block, "text") orelse return error.InvalidProviderState).len;
-}
-
-fn writeReplay(writer: *std.Io.Writer, prefix: []const u8, blocks: []const std.json.Value, ids: []const []const u8) !void {
-    try writer.writeAll("{\"prefix\":");
-    try std.json.Stringify.value(prefix, .{}, writer);
-    try writer.writeAll(",\"blocks\":[");
-    for (blocks, 0..) |block, index| {
-        if (index != 0) try writer.writeByte(',');
-        try std.json.Stringify.value(block, .{}, writer);
-    }
-    try writer.writeAll("],\"" ++ association_field ++ "\":[");
-    for (ids, 0..) |id, index| {
-        if (index != 0) try writer.writeByte(',');
-        try std.json.Stringify.value(id, .{}, writer);
-    }
-    try writer.writeAll("]}");
+fn entrySize(entry: []const u8) ?usize {
+    return std.fmt.parseUnsigned(usize, entry[1..], 10) catch null;
 }
 
 /// Keeps the reply's thinking with the calls fx keeps. `text` false drops the
@@ -390,47 +396,53 @@ fn writeReplay(writer: *std.Io.Writer, prefix: []const u8, blocks: []const std.j
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) Error!?types.ProviderReplay {
     const value = replay orelse return null;
     if (!reasoning) return null;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const parsed = try parseReplay(arena, value.parts_json);
-    var kept: std.ArrayList(std.json.Value) = .empty;
-    var kept_ids: std.ArrayList([]const u8) = .empty;
+    const parsed = Replay.parse(value.parts_json) orelse return null;
+    var layout: std.Io.Writer.Allocating = .init(alloc);
+    defer layout.deinit();
+    var blocks: std.Io.Writer.Allocating = .init(alloc);
+    defer blocks.deinit();
     var changed = false;
-    for (parsed.blocks) |block| {
-        const kind = blockType(block);
-        if (std.mem.eql(u8, kind, "text") and !text) {
+    var kept_calls: usize = 0;
+    var offset: usize = 0;
+    var it = parsed.entries();
+    while (it.next()) |entry| {
+        var keep = true;
+        switch (entry[0]) {
+            't' => keep = text,
+            'u' => {
+                keep = for (calls) |call| {
+                    if (std.mem.eql(u8, call.id, entry[1..])) break true;
+                } else false;
+                if (keep) kept_calls += 1;
+            },
+            'k', 'c', 'C' => {
+                const size = entrySize(entry) orelse return error.InvalidProviderState;
+                if (size > parsed.blocks.len - offset) return error.InvalidProviderState;
+                blocks.writer.writeAll(parsed.blocks[offset..][0..size]) catch return error.OutOfMemory;
+                offset += size;
+            },
+            else => return error.InvalidProviderState,
+        }
+        if (!keep) {
             changed = true;
             continue;
         }
-        if (std.mem.eql(u8, kind, "tool_use")) {
-            const id = blockString(block, "id") orelse return error.InvalidProviderState;
-            const keep = for (calls) |call| {
-                if (std.mem.eql(u8, call.id, id)) break true;
-            } else false;
-            if (!keep) {
-                changed = true;
-                continue;
-            }
-            try kept_ids.append(arena, id);
-        }
-        try kept.append(arena, block);
+        if (layout.written().len != 0) layout.writer.writeByte(' ') catch return error.OutOfMemory;
+        layout.writer.writeAll(entry) catch return error.OutOfMemory;
     }
-    if (kept_ids.items.len != calls.len) return null;
+    if (kept_calls != calls.len) return null;
     if (!changed) return value;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    writeReplay(&out.writer, parsed.prefix, kept.items, kept_ids.items) catch return error.OutOfMemory;
-    return .{ .source = value.source, .parts_json = try out.toOwnedSlice() };
+    const parts = std.mem.concat(alloc, u8, &.{ replay_magic, parsed.prefix, "\n", layout.written(), "\n", blocks.written() }) catch return error.OutOfMemory;
+    return .{ .source = value.source, .parts_json = parts };
 }
 
 /// The digest a reply to `body` records as its prefix, or null for a body
 /// this codec did not write.
-pub fn bodyPrefix(body: []const u8) ?[32]u8 {
+pub fn bodyPrefix(body: []const u8) ?Digest {
     const end = std.mem.findLast(u8, body, messages_end) orelse return null;
-    var digest: [32]u8 = undefined;
-    Sha256.hash(body[0..end], &digest, .{});
-    return digest;
+    var hasher: PrefixHash = .{};
+    hasher.update(body[0..end]);
+    return hasher.final();
 }
 
 // ---------------------------------------------------------------------------
@@ -499,12 +511,12 @@ const Renderer = struct {
     projection: *const tool_call_ids.Projection,
     /// The body. Prefix digests hash its bytes as they are written.
     out: *std.Io.Writer.Allocating,
-    hasher: Sha256 = .init(.{}),
+    hasher: PrefixHash = .{},
     hashed: usize = 0,
     wire_count: usize = 0,
 
     /// The hasher over every byte written so far.
-    fn synced(self: *Renderer) Sha256 {
+    fn synced(self: *Renderer) PrefixHash {
         const written = self.out.written();
         self.hasher.update(written[self.hashed..]);
         self.hashed = written.len;
@@ -513,7 +525,7 @@ const Renderer = struct {
 
     /// The prefix digest after the messages written so far, the message
     /// still open, and a user message of `first` and `second` blocks.
-    fn pendingDigest(self: *Renderer, open: ?Side, body: []const u8, first: ?[]const u8, second: []const u8) [32]u8 {
+    fn pendingDigest(self: *Renderer, open: ?Side, body: []const u8, first: ?[]const u8, second: []const u8) Digest {
         var hasher = self.synced();
         var count = self.wire_count;
         if (open) |side| {
@@ -531,9 +543,7 @@ const Renderer = struct {
             hasher.update(second);
             hasher.update("]}");
         }
-        var digest: [32]u8 = undefined;
-        hasher.final(&digest);
-        return digest;
+        return hasher.final();
     }
 
     fn write(self: *Renderer) !void {
@@ -705,13 +715,8 @@ const Renderer = struct {
             const message = self.request.messages[index];
             if (message.role != .assistant) continue;
             const replay = message.provider_replay orelse continue;
-            if (std.mem.find(u8, replay.parts_json, "\"prefix\":\"" ++ compaction_prefix ++ "\"") == null) continue;
-            const parsed = parseReplay(self.arena, replay.parts_json) catch continue;
-            for (parsed.blocks) |block| {
-                if (!std.mem.eql(u8, blockType(block), "compaction")) continue;
-                const summary = block.object.get("content") orelse continue;
-                if (summary == .string) return index;
-            }
+            const parsed = Replay.parse(replay.parts_json) orelse continue;
+            if (parsed.summarizes()) return index;
         }
         return 0;
     }
@@ -729,7 +734,6 @@ const Renderer = struct {
         var tail: std.Io.Writer.Allocating = .init(self.arena);
         // User blocks moved behind the reply that follows them; see deferTail.
         var deferred: std.Io.Writer.Allocating = .init(self.arena);
-        var before: [32]u8 = undefined;
         var index = start;
         while (index < messages.len) {
             const message = messages[index];
@@ -739,10 +743,11 @@ const Renderer = struct {
             var consumed: usize = 1;
             switch (side) {
                 .assistant => {
-                    // A reply's prefix ends with the message before its own.
-                    const prefix = if (current == side) before else self.pendingDigest(current, body.written(), null, "");
-                    try self.writeAssistant(&blocks.writer, message, prefix, first_wire);
-                    if (current != side) before = prefix;
+                    // A reply's prefix ends with the message before its own
+                    // wire message: an open user message counts, an open
+                    // assistant message this one joins does not.
+                    const open: ?Side = if (current == .assistant) null else current;
+                    try self.writeAssistant(&blocks.writer, message, open, body.written(), first_wire);
                 },
                 .user => {
                     kept.clearRetainingCapacity();
@@ -788,8 +793,8 @@ const Renderer = struct {
         if (tail.len == 0 or kept.len == 0) return false;
         if (next.role != .assistant or next.tool_calls.len != 0) return false;
         const replay = next.provider_replay orelse return false;
-        const parsed = parseReplay(self.arena, replay.parts_json) catch return false;
-        if (parsed.prefix.len != 64) return false;
+        const parsed = Replay.parse(replay.parts_json) orelse return false;
+        if (parsed.prefix.len != digest_hex_len) return false;
         var hex = std.fmt.bytesToHex(self.pendingDigest(open, body, kept, tail), .lower);
         if (std.mem.eql(u8, parsed.prefix, &hex)) return false;
         hex = std.fmt.bytesToHex(self.pendingDigest(open, body, kept, ""), .lower);
@@ -884,9 +889,9 @@ const Renderer = struct {
         try w.writeByte('}');
     }
 
-    fn writeAssistant(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, prefix: [32]u8, first_wire: bool) !void {
+    fn writeAssistant(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, open: ?Side, body: []const u8, first_wire: bool) !void {
         if (message.provider_replay) |replay| {
-            if (try self.writeReplayed(w, message, replay, prefix, first_wire)) return;
+            if (try self.writeReplayed(w, message, replay, open, body, first_wire)) return;
         }
         var wrote = false;
         if (message.content) |text| if (text.len != 0) {
@@ -902,55 +907,60 @@ const Renderer = struct {
     /// Writes the reply's blocks in their order, with text and tool calls
     /// from fx's message. Returns false when that message no longer matches
     /// the reply, so the canonical form must be written instead.
-    fn writeReplayed(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, replay: types.ProviderReplay, prefix: [32]u8, first_wire: bool) !bool {
-        const parsed = parseReplay(self.arena, replay.parts_json) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidProviderState,
-        };
-        if (parsed.ids.len != message.tool_calls.len) return error.InvalidProviderState;
-        for (parsed.ids, message.tool_calls) |id, call| if (!std.mem.eql(u8, id.string, call.id)) return error.InvalidProviderState;
+    fn writeReplayed(self: *Renderer, w: *std.Io.Writer, message: types.ChatMessage, replay: types.ProviderReplay, open: ?Side, body: []const u8, first_wire: bool) !bool {
+        const parsed = Replay.parse(replay.parts_json) orelse return false;
+        if (!parsed.matchesCalls(message.tool_calls)) return false;
         const content = message.content orelse "";
         var covered: usize = 0;
-        var texts: usize = 0;
-        for (parsed.blocks) |block| {
-            if (!std.mem.eql(u8, blockType(block), "text")) continue;
-            const length = try textLength(block);
-            if (length == 0) continue;
-            if (texts != 0) covered += text_block_separator.len;
-            covered += length;
-            texts += 1;
-        }
-        if (covered != content.len) {
+        var stored: usize = 0;
+        var it = parsed.entries();
+        while (it.next()) |entry| switch (entry[0]) {
+            't' => {
+                if (covered != 0) covered += text_block_separator.len;
+                covered += entrySize(entry) orelse return false;
+            },
+            'k', 'c', 'C' => stored += entrySize(entry) orelse return false,
+            'u' => {},
+            else => return false,
+        };
+        if (covered != content.len or stored != parsed.blocks.len) {
             debug_trace.logf("gateway", "anthropic_replay_text_changed canonical=true", .{});
             return false;
         }
-        var hex = std.fmt.bytesToHex(prefix, .lower);
-        const bound = if (std.mem.eql(u8, parsed.prefix, compaction_prefix)) first_wire else std.mem.eql(u8, parsed.prefix, &hex);
+        // Hashing the history is needed only for a reply with thinking.
+        const bound = if (std.mem.eql(u8, parsed.prefix, compaction_prefix))
+            first_wire
+        else if (!parsed.hasThinking())
+            true
+        else
+            std.mem.eql(u8, parsed.prefix, &std.fmt.bytesToHex(self.pendingDigest(open, body, null, ""), .lower));
         if (!bound) debug_trace.logf("gateway", "anthropic_replay_prefix_changed thinking_omitted=true", .{});
         var wrote = false;
-        var offset: usize = 0;
-        for (parsed.blocks) |block| {
-            const kind = blockType(block);
-            if (std.mem.eql(u8, kind, "text")) {
-                const length = try textLength(block);
-                if (length == 0) continue;
-                if (offset != 0) offset += text_block_separator.len;
+        var text_offset: usize = 0;
+        var block_offset: usize = 0;
+        it.reset();
+        while (it.next()) |entry| switch (entry[0]) {
+            't' => {
+                const size = entrySize(entry).?;
+                if (text_offset != 0) text_offset += text_block_separator.len;
                 try separator(w, &wrote);
-                try writeText(w, content[offset..][0..length]);
-                offset += length;
-            } else if (std.mem.eql(u8, kind, "tool_use")) {
-                const id = blockString(block, "id") orelse return error.InvalidProviderState;
-                const call = for (message.tool_calls) |call| {
-                    if (std.mem.eql(u8, call.id, id)) break call;
-                } else return error.InvalidProviderState;
+                try writeText(w, content[text_offset..][0..size]);
+                text_offset += size;
+            },
+            'u' => for (message.tool_calls) |call| {
+                if (!std.mem.eql(u8, call.id, entry[1..])) continue;
                 try separator(w, &wrote);
                 try self.writeToolUse(w, call);
-            } else {
-                if (!bound and isThinking(block)) continue;
+                break;
+            },
+            else => {
+                const block = parsed.blocks[block_offset..][0..entrySize(entry).?];
+                block_offset += block.len;
+                if (entry[0] == 'k' and !bound) continue;
                 try separator(w, &wrote);
-                try std.json.Stringify.value(block, .{}, w);
-            }
-        }
+                try w.writeAll(block);
+            },
+        };
         return true;
     }
 };
@@ -1038,7 +1048,7 @@ pub const Reducer = struct {
     limits: Limits,
     choice: types.ToolChoice,
     functions: []const Function = &.{},
-    prefix: [64]u8,
+    prefix: [digest_hex_len]u8,
     blocks: std.ArrayList(Block) = .empty,
     message_id: ?[]const u8 = null,
     usage: struct {
@@ -1061,7 +1071,7 @@ pub const Reducer = struct {
     failure: ?struct { kind: stream_provider.FailureKind, detail: []const u8 } = null,
 
     /// `prefix` is the digest of the request this reply answers, from bodyPrefix.
-    pub fn init(alloc: Allocator, request: stream_provider.RequestData, prefix: ?[32]u8, limits: Limits) Error!Reducer {
+    pub fn init(alloc: Allocator, request: stream_provider.RequestData, prefix: ?Digest, limits: Limits) Error!Reducer {
         var self: Reducer = .{
             .alloc = alloc,
             .arena_state = std.heap.ArenaAllocator.init(alloc),
@@ -1322,6 +1332,64 @@ pub const Reducer = struct {
         return .{ .input_tokens = input, .output_tokens = usage.output, .cache_read_tokens = usage.cache_read, .cache_write_tokens = usage.cache_write, .reasoning_tokens = usage.thinking };
     }
 
+    /// The reply's replay text; null when its tool call ids cannot be stored.
+    /// Caller owns the result.
+    fn replayState(self: *Reducer) (Error || std.Io.Writer.Error)!?[]u8 {
+        const arena_alloc = self.arena();
+        var layout: std.Io.Writer.Allocating = .init(arena_alloc);
+        var stored: std.Io.Writer.Allocating = .init(arena_alloc);
+        var compaction = false;
+        var replayable = true;
+        for (self.blocks.items) |block| {
+            const before = stored.written().len;
+            const kind: u8 = switch (block.kind) {
+                .text => {
+                    if (block.text.items.len == 0) continue;
+                    try separatedEntry(&layout, 't');
+                    try layout.writer.print("{d}", .{block.text.items.len});
+                    continue;
+                },
+                .tool_use => {
+                    for (block.id) |byte| if (byte <= ' ' or byte >= 0x7f) {
+                        replayable = false;
+                    };
+                    try separatedEntry(&layout, 'u');
+                    try layout.writer.writeAll(block.id);
+                    continue;
+                },
+                .thinking => kind: {
+                    try stored.writer.writeAll("{\"type\":\"thinking\",\"thinking\":");
+                    try std.json.Stringify.value(block.text.items, .{}, &stored.writer);
+                    try stored.writer.writeAll(",\"signature\":");
+                    try std.json.Stringify.value(block.signature.items, .{}, &stored.writer);
+                    break :kind 'k';
+                },
+                .redacted_thinking => kind: {
+                    try stored.writer.writeAll("{\"type\":\"redacted_thinking\",\"data\":");
+                    try std.json.Stringify.value(block.data, .{}, &stored.writer);
+                    break :kind 'k';
+                },
+                .compaction => kind: {
+                    try stored.writer.writeAll("{\"type\":\"compaction\",\"content\":");
+                    try std.json.Stringify.value(if (block.summary_present) @as(?[]const u8, block.text.items) else null, .{}, &stored.writer);
+                    compaction = compaction or block.summary_present;
+                    break :kind if (block.summary_present) 'C' else 'c';
+                },
+            };
+            try stored.writer.writeByte('}');
+            try separatedEntry(&layout, kind);
+            try layout.writer.print("{d}", .{stored.written().len - before});
+        }
+        if (compaction) debug_trace.logf("gateway", "anthropic_server_compaction summary_bytes={d}", .{self.reasoning_bytes});
+        const prefix: []const u8 = if (compaction) compaction_prefix else &self.prefix;
+        const state_len = replay_magic.len + prefix.len + 1 + layout.written().len + 1 + stored.written().len;
+        if (state_len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
+        // Without thinking or compaction there is nothing fx's own message
+        // cannot rebuild, so the reply goes back in its canonical form.
+        if (!replayable or stored.written().len == 0) return null;
+        return try std.mem.concat(self.alloc, u8, &.{ replay_magic, prefix, "\n", layout.written(), "\n", stored.written() });
+    }
+
     /// The reply as fx keeps it. A stream that ended in an `error` event is a
     /// failed result; one cut off before `message_stop` is an error.
     pub fn finish(self: *Reducer, cancelled: bool) Error!stream_provider.Result {
@@ -1341,41 +1409,16 @@ pub const Reducer = struct {
 
         const arena_alloc = self.arena();
         var text: std.ArrayList(u8) = .empty;
-        var kept: std.ArrayList(std.json.Value) = .empty;
-        var ids: std.ArrayList([]const u8) = .empty;
-        var compaction = false;
-        for (self.blocks.items) |*block| {
-            var fields: std.json.ObjectMap = .empty;
-            try fields.put(arena_alloc, "type", .{ .string = @tagName(block.kind) });
-            switch (block.kind) {
-                .text => {
-                    if (block.text.items.len == 0) continue;
-                    if (text.items.len != 0) try text.appendSlice(arena_alloc, text_block_separator);
-                    try text.appendSlice(arena_alloc, block.text.items);
-                    try fields.put(arena_alloc, "n", .{ .integer = @intCast(block.text.items.len) });
-                },
-                .thinking => {
-                    try fields.put(arena_alloc, "thinking", .{ .string = block.text.items });
-                    try fields.put(arena_alloc, "signature", .{ .string = block.signature.items });
-                },
-                .redacted_thinking => try fields.put(arena_alloc, "data", .{ .string = block.data }),
-                .tool_use => {
-                    try fields.put(arena_alloc, "id", .{ .string = block.id });
-                    try ids.append(arena_alloc, block.id);
-                },
-                .compaction => {
-                    compaction = compaction or block.summary_present;
-                    try fields.put(arena_alloc, "content", if (block.summary_present) .{ .string = block.text.items } else .null);
-                },
-            }
-            try kept.append(arena_alloc, .{ .object = fields });
+        for (self.blocks.items) |block| {
+            if (block.kind != .text or block.text.items.len == 0) continue;
+            if (text.items.len != 0) try text.appendSlice(arena_alloc, text_block_separator);
+            try text.appendSlice(arena_alloc, block.text.items);
         }
-        if (compaction) debug_trace.logf("gateway", "anthropic_server_compaction summary_bytes={d}", .{self.reasoning_bytes});
-
-        var state: std.Io.Writer.Allocating = .init(self.alloc);
-        defer state.deinit();
-        writeReplay(&state.writer, if (compaction) compaction_prefix else &self.prefix, kept.items, ids.items) catch return error.OutOfMemory;
-        if (state.written().len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
+        const provider_state = self.replayState() catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => |failure| return failure,
+        };
+        errdefer if (provider_state) |state| self.alloc.free(state);
 
         var calls: std.ArrayList(types.ToolCall) = .empty;
         errdefer {
@@ -1404,7 +1447,6 @@ pub const Reducer = struct {
         errdefer if (failure_detail) |detail| self.alloc.free(detail);
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         errdefer types.freeToolCallSlice(self.alloc, owned_calls);
-        const provider_state = try state.toOwnedSlice();
         self.phase = .closed;
         return .{ .completed = .{
             .completion = .{
@@ -1421,6 +1463,11 @@ pub const Reducer = struct {
         } };
     }
 };
+
+fn separatedEntry(layout: *std.Io.Writer.Allocating, kind: u8) !void {
+    if (layout.written().len != 0) try layout.writer.writeByte(' ');
+    try layout.writer.writeByte(kind);
+}
 
 fn finishReason(raw: []const u8) types.ProviderFinishReason {
     if (std.mem.eql(u8, raw, "end_turn") or std.mem.eql(u8, raw, "stop_sequence")) return .stop;
@@ -1664,7 +1711,7 @@ test "anthropic user images become base64 image blocks before the text" {
     const alloc = std.testing.allocator;
     const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82";
     var digest: [32]u8 = undefined;
-    Sha256.hash(png, &digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(png, &digest, .{});
     var hex = std.fmt.bytesToHex(digest, .lower);
     const image: types.ImageAttachment = .{ .path = @constCast("pixel.png"), .media_type = @constCast("image/png"), .inline_data = @constCast(png), .snapshot_sha256 = &hex };
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "what color?", .images = &.{image} }};
@@ -1773,8 +1820,7 @@ test "anthropic stream parses thinking, signature, text, tools, usage and keeps 
     try expectContains(state, "{\"type\":\"redacted_thinking\",\"data\":\"b3BhcXVl\"}");
     // Text and tool calls come back from fx's own message; the replay keeps
     // only where they sat.
-    try expectContains(state, "{\"type\":\"text\",\"n\":12},{\"type\":\"tool_use\",\"id\":\"toolu_A\"},{\"type\":\"tool_use\",\"id\":\"toolu_B\"}");
-    try expectContains(state, "\"_tool_call_ids\":[\"toolu_A\",\"toolu_B\"]");
+    try expectContains(state, " t12 utoolu_A utoolu_B\n");
 }
 
 test "anthropic tool roundtrip replays thinking unchanged and drops it only when the prefix changed" {
@@ -1839,7 +1885,7 @@ test "anthropic replay projection keeps thinking with the kept calls" {
     defer alloc.free(one.parts_json);
     try expectContains(one.parts_json, "\"signature\":\"c2lnbmVk\"");
     try std.testing.expect(std.mem.find(u8, one.parts_json, "toolu_B") == null);
-    try std.testing.expect(std.mem.find(u8, one.parts_json, "\"type\":\"text\"") == null);
+    try std.testing.expect(std.mem.find(u8, one.parts_json, "t12") == null);
     try std.testing.expect(try project_replay(alloc, replay, &.{.{ .id = "other", .name = "read_file", .arguments_json = "{}" }}, true, true) == null);
 }
 
@@ -1913,7 +1959,7 @@ test "anthropic server compaction block is kept and later requests start at it" 
     var result = try testStream(alloc, testRequest("claude-haiku-5-5", &history), wire, null);
     defer result.deinit(alloc);
     const completion = result.completed.completion;
-    try expectContains(completion.provider_state_json.?, "\"prefix\":\"compaction\"");
+    try std.testing.expect(std.mem.startsWith(u8, completion.provider_state_json.?, "fxa1 compaction\n"));
     try expectContains(completion.provider_state_json.?, "{\"type\":\"compaction\",\"content\":\"Summary: task T open.\"}");
     const next = history ++ [_]types.ChatMessage{
         .{ .role = .assistant, .content = "Done.", .provider_replay = .{ .source = .{ .provider = test_provider, .model = "claude-haiku-5-5" }, .parts_json = completion.provider_state_json.? } },
@@ -1982,7 +2028,7 @@ test "anthropic notes fx adds after a turn's final reply move behind it and keep
     try expectContains(stripped, "\"content\":[{\"type\":\"text\",\"text\":\"A\"}]},{\"type\":\"text\",\"text\":\"Session file evidence: a read\"}]}");
 }
 
-test "anthropic thinking survives a change of effort and reads the first replay format" {
+test "anthropic thinking survives a change of effort and earlier replay formats are ignored" {
     const alloc = std.testing.allocator;
     const first_messages = [_]types.ChatMessage{.{ .role = .user, .content = "read a.txt" }};
     var first_request = testRequest("claude-sonnet-5-5", &first_messages);
@@ -2004,14 +2050,11 @@ test "anthropic thinking survives a change of effort and reads the first replay 
     try expectContains(body, "\"signature\":\"c2lnbmVk\"");
     try expectContains(body, "\"output_config\":{\"effort\":\"high\"}");
 
-    // A session saved before the replay kept only thinking stores whole blocks.
-    const first_body = try build_request(alloc, first_request, testSettings(&test_options));
-    defer alloc.free(first_body);
-    const hex = std.fmt.bytesToHex(bodyPrefix(first_body).?, .lower);
-    const legacy = try std.fmt.allocPrint(alloc, "{{\"prefix\":\"{s}\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"Need the file.\",\"signature\":\"c2lnbmVk\"}},{{\"type\":\"text\",\"text\":\"Let me look.\"}},{{\"type\":\"tool_use\",\"id\":\"toolu_A\",\"name\":\"read_file\",\"input\":{{}}}},{{\"type\":\"tool_use\",\"id\":\"toolu_B\",\"name\":\"skill__run\",\"input\":{{}}}}],\"_tool_call_ids\":[\"toolu_A\",\"toolu_B\"]}}", .{&hex});
-    defer alloc.free(legacy);
-    next[1].provider_replay = .{ .source = source, .parts_json = legacy };
+    // A replay in an earlier format is ignored: the reply goes out in its
+    // canonical form, without thinking.
+    next[1].provider_replay = .{ .source = source, .parts_json = "{\"prefix\":\"x\",\"content\":[],\"_tool_call_ids\":[]}" };
     const legacy_body = try build_request(alloc, testRequest("claude-sonnet-5-5", &next), testSettings(&test_options));
     defer alloc.free(legacy_body);
-    try expectContains(legacy_body, "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Need the file.\",\"signature\":\"c2lnbmVk\"},{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"toolu_A\"");
+    try std.testing.expect(std.mem.find(u8, legacy_body, "signature") == null);
+    try expectContains(legacy_body, "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"toolu_A\"");
 }
