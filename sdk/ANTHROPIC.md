@@ -27,3 +27,13 @@ In the fx CLI, the same provider is a `providers` entry in `~/.fx/settings.json`
 ```
 
 Without `base_url` and `auth`, it uses `https://api.anthropic.com` and the key in `ANTHROPIC_API_KEY`.
+
+## Installing this fork
+
+npm's `libfx` is upstream's and has no Anthropic transport. Install from a [release of this fork](https://github.com/Deadweight-Labs/fx/releases) instead, which also brings the native addon for Linux (x64, arm64) or macOS from that release:
+
+```sh
+npm install https://github.com/Deadweight-Labs/fx/releases/download/v0.0.16-anthropic.1/libfx-0.0.16-anthropic.1.tgz
+```
+
+A release is made from the Actions tab ("Release (Anthropic)"), which tags main as `v<fx version>-anthropic.<n>`, or by pushing such a tag. The fx CLI archives of a release never update themselves: `fx upgrade` would install upstream fx.

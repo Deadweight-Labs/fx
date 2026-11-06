@@ -1,0 +1,380 @@
+# Releases this fork as a GitHub release: libfx for Node with the native
+# addons for Linux and macOS, and the fx CLI. Nothing goes to npm, a CDN or
+# Apple; the repository's own token is the only credential.
+#
+# Run it from the Actions tab (it tags main as v<fx version>-anthropic.<n>) or
+# push such a tag. libfx's optional dependencies point at this release's
+# platform packages, so `npm install <libfx tarball URL>` installs the addon
+# built here and never upstream's @libfx packages from npm.
+name: Release (Anthropic)
+
+on:
+  push:
+    tags: ["v*-anthropic.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-anthropic
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      sha: ${{ steps.metadata.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag and version
+        id: metadata
+        run: |
+          set -euo pipefail
+          BASE=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG="$GITHUB_REF_NAME"
+          elif [ "$GITHUB_REF_NAME" = main ]; then
+            LAST=$(git tag -l "v${BASE}-anthropic.*" | sed 's/.*-anthropic\.//' | grep -E '^[0-9]+$' | sort -n | tail -1)
+            TAG="v${BASE}-anthropic.$(( ${LAST:-0} + 1 ))"
+          else
+            echo "::error::release from main or from a v*-anthropic.* tag"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          if ! [[ "$VERSION" =~ ^${BASE//./\\.}-anthropic\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::${TAG} does not match this checkout's fx version ${BASE} (expected v${BASE}-anthropic.<n>)"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${TAG} from $(git rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  native:
+    needs: metadata
+    name: Native (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+            cli: linux-x86_64
+            napi_flags: -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
+            cli_flags: -Dtarget=x86_64-linux -Dcpu=baseline
+            runtime_image: public.ecr.aws/lambda/nodejs@sha256:2472f0273d8848d8b2aa6528f5526b8a514b70703596199efe5a4b84d3d59b0b
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            cli: linux-aarch64
+            napi_flags: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline
+            cli_flags: -Dtarget=aarch64-linux -Dcpu=baseline
+            runtime_image: public.ecr.aws/lambda/nodejs@sha256:104527dd19c1907b4aaf328b5b3af1ac0c5db6bb9c76be8cb73fb295ec58b0fe
+          - runner: macos-15-intel
+            platform: darwin-x64
+            cli: macos-x86_64
+            cli_flags: -Dtarget=x86_64-macos
+          - runner: macos-15
+            platform: darwin-arm64
+            cli: macos-aarch64
+            cli_flags: -Dtarget=aarch64-macos
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Build the fx CLI
+        run: zig build -Doptimize=ReleaseSafe ${{ matrix.cli_flags }}
+
+      - name: Smoke-test and package the fx CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/fx --version
+          ./zig-out/bin/fx help >/dev/null
+          mkdir -p release cli
+          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md cli/
+          tar -czf release/fx-${{ matrix.cli }}.tar.gz -C cli fx LICENSE THIRD_PARTY_NOTICES.md
+
+      - name: Build the ReleaseSafe addon
+        run: zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe ${{ matrix.napi_flags }}
+
+      - name: Check Linux ABI baseline
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          python3 sdk/tests/test-linux-abi.py
+          python3 sdk/scripts/check-linux-abi.py zig-out/lib/libfx.node
+
+      - name: Test the Linux addon on Amazon Linux 2023
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          docker run --rm --network none --entrypoint /bin/bash \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            '${{ matrix.runtime_image }}' -euc '
+              node -e '\''const assert = require("node:assert/strict"); assert.equal(process.report.getReport().header.glibcVersionRuntime, "2.34");'\''
+              node sdk/tests/test-native-core-ready.mjs
+              node sdk/tests/test-host-tools.mjs native
+              node sdk/tests/test-host-tool-cancel.mjs native
+            '
+
+      - name: Test the native addon
+        run: |
+          npm run --prefix sdk test:node-napi
+          node sdk/tests/test-agent-anthropic.mjs native
+
+      - name: Name the addon for packaging
+        shell: bash
+        run: |
+          mkdir -p native-addons
+          cp zig-out/lib/libfx.node native-addons/libfx.${{ matrix.platform }}.node
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: native-addons/libfx.${{ matrix.platform }}.node
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-cli-${{ matrix.cli }}
+          path: release/fx-${{ matrix.cli }}.tar.gz
+          if-no-files-found: error
+
+  wasm:
+    needs: metadata
+    name: WebAssembly (ReleaseSmall)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Build ReleaseSmall WebAssembly surfaces
+        run: |
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
+
+      - name: Shrink WebAssembly surfaces with wasm-opt
+        run: |
+          npm ci --prefix sdk/tools
+          node sdk/scripts/optimize-wasm.mjs zig-out/bin/fx-core.wasm zig-out/bin/fx-term.wasm
+
+      - name: Test Node and WebAssembly
+        run: |
+          npm ci --prefix sdk/node
+          npm run --prefix sdk test:node-wasm
+          node --experimental-wasm-jspi sdk/tests/test-agent-anthropic.mjs wasm
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wasm
+          path: |
+            zig-out/bin/fx-core.wasm
+            zig-out/bin/fx-term.wasm
+          if-no-files-found: error
+
+  package:
+    needs: [metadata, native, wasm]
+    runs-on: ubuntu-24.04
+    env:
+      LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+      ASSET_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.18.0"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: native-addons
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wasm
+          path: wasm-artifacts
+
+      - name: Install the durable Worlds
+        run: npm ci --prefix sdk/durable
+
+      - name: Assemble the packages
+        run: |
+          set -euo pipefail
+          mkdir -p zig-out/bin zig-out/lib release
+          cp wasm-artifacts/*.wasm zig-out/bin/
+          cp native-addons/libfx.linux-x64.node zig-out/lib/libfx.node
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/*.node
+          for package in sdk/dist/libfx-*/; do
+            npm pack "./$package" --ignore-scripts --pack-destination release --json
+          done | jq -s add > /tmp/native-pack.json
+          npm pack ./sdk/dist/libfx --ignore-scripts --pack-destination /tmp --json > /tmp/libfx-pack.json
+
+      - name: Validate the platform packages
+        run: |
+          node -e '
+            const manifest = require("./sdk/dist/libfx/package.json");
+            const reports = require("/tmp/native-pack.json");
+            const pinned = Object.keys(manifest.optionalDependencies).sort();
+            if (reports.map(({ name }) => name).sort().join() !== pinned.join()) throw new Error(`platform packages do not match ${pinned.join(", ")}`);
+            for (const report of reports) {
+              if (report.version !== manifest.version) throw new Error(`${report.name}@${report.version} is not libfx@${manifest.version}`);
+              const files = report.files.map(({ path }) => path).sort().join();
+              if (files !== "LICENSE,README.md,index.js,libfx.node,package.json") throw new Error(`${report.name} has unexpected files: ${files}`);
+            }
+            const files = new Set(require("/tmp/libfx-pack.json")[0].files.map(({ path }) => path));
+            for (const name of ["anthropic-provider.js", "types/anthropic-provider.d.cts", "fx-core.wasm", "fx-term.wasm", "node.js"]) {
+              if (!files.has(name)) throw new Error(`libfx is missing ${name}`);
+            }
+          '
+
+      - name: Smoke-test the packed libfx
+        run: |
+          node sdk/tests/test-packed-example.mjs "/tmp/$(jq -r '.[0].filename' /tmp/libfx-pack.json)" native esm --native-dir release
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs "/tmp/$(jq -r '.[0].filename' /tmp/libfx-pack.json)" wasm esm
+
+      # On npm the optional dependencies name upstream's @libfx packages, which
+      # carry no Anthropic transport. Here they name this release's own.
+      - name: Point the optional dependencies at this release
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const path = "sdk/dist/libfx/package.json";
+            const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+            for (const { name, filename } of require("/tmp/native-pack.json")) {
+              manifest.optionalDependencies[name] = `${process.env.ASSET_BASE}/${filename}`;
+            }
+            fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+            console.log(manifest.optionalDependencies);
+          '
+          npm pack ./sdk/dist/libfx --ignore-scripts --pack-destination release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-libfx
+          path: release/*.tgz
+          if-no-files-found: error
+
+  release:
+    needs: [metadata, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+      SHA: ${{ needs.metadata.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish the GitHub release
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -- * > SHA256SUMS
+          URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG"
+          cat > ../notes.md <<EOF
+          Unofficial build of [vercel-labs/fx](https://github.com/vercel-labs/fx) ${VERSION%%-*} with the native Anthropic Messages transport (\`"protocol": "anthropic-messages"\`), from $SHA.
+
+          **libfx for Node**
+
+          \`\`\`
+          npm install $URL/libfx-$VERSION.tgz
+          \`\`\`
+
+          npm takes the native addon for Linux (x64, arm64; glibc 2.34 or later) or macOS from this release too. Elsewhere libfx runs on WebAssembly (\`node --experimental-wasm-jspi\`). Setup: [sdk/ANTHROPIC.md]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$SHA/sdk/ANTHROPIC.md).
+
+          **fx CLI**: \`fx-<platform>.tar.gz\`. These builds never update themselves; \`fx upgrade\` would install upstream fx, which has no Anthropic transport. The macOS builds are not notarized, so after a browser download run \`xattr -d com.apple.quarantine fx\`.
+
+          Checksums: \`SHA256SUMS\`.
+          EOF
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "$TAG" --notes-file ../notes.md -- *
+
+  verify:
+    needs: [metadata, release]
+    name: Install from the release (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+          sparse-checkout: .github/anthropic
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Install libfx from the release and run it
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer"
+          cp .github/anthropic/verify-release.mjs "$consumer/"
+          cd "$consumer"
+          echo '{"private":true,"type":"module"}' > package.json
+          npm install --no-audit --no-fund "$URL/libfx-$VERSION.tgz"
+          # The addon must come from this release, not from npm.
+          jq -e --arg url "$URL/" '[.packages | to_entries[] | select(.key | startswith("node_modules/@libfx/")) | .value.resolved | startswith($url)] | length > 0 and all' package-lock.json
+          node verify-release.mjs "$VERSION" native
+          node --experimental-wasm-jspi verify-release.mjs "$VERSION" wasm
+
+      - name: Run the fx CLI from the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) name=linux-x86_64 ;;
+            Linux-ARM64) name=linux-aarch64 ;;
+            macOS-ARM64) name=macos-aarch64 ;;
+          esac
+          curl -fsSL "$URL/fx-$name.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/fx" --version

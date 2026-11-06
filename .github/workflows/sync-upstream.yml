@@ -29,6 +29,7 @@ env:
   # Workflows that may run on this fork; any other is disabled.
   ALLOWED: >-
     .github/workflows/sync-upstream.yml
+    .github/workflows/release-anthropic.yml
     .github/workflows/ci.yml
     .github/workflows/macos.yml
     .github/workflows/examples.yml
