@@ -59,6 +59,7 @@ const files = [
   ["sdk/grok.js", "grok.js"],
   ["sdk/grok-sign-in.js", "grok-sign-in.js"],
   ["sdk/custom-provider.js", "custom-provider.js"],
+  ["sdk/anthropic-provider.js", "anthropic-provider.js"],
   ["sdk/fetch-cleanup.js", "fetch-cleanup.js"],
   ["sdk/mcp.js", "mcp.js"],
   ["sdk/skills.js", "skills.js"],
