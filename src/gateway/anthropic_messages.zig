@@ -305,7 +305,13 @@ fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const
     const state: *Review = @ptrCast(@alignCast(raw));
     const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
     defer alloc.free(expanded);
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("low") }, .max_output_tokens = 4096 });
+    // Each review's prompt carries the reviewed action inside its one system
+    // block, so no later request shares its prefix; caching would only pay
+    // the write surcharge.
+    var options = state.definition.anthropic;
+    options.prompt_caching = false;
+    const identity = bound_identity(state.definition);
+    return codec.build_request(alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("low") }, .max_output_tokens = 4096 }, .{ .options = &options, .provider = &identity });
 }
 fn ignore_event(_: *anyopaque, _: streams.Event) void {}
 fn free_result(raw: *anyopaque, alloc: Allocator) void {

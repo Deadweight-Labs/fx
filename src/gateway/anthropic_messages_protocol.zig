@@ -688,6 +688,8 @@ const Renderer = struct {
         var body: std.Io.Writer.Allocating = .init(self.arena);
         var before: [32]u8 = self.digestNow();
         var wire_count: usize = 0;
+        // User blocks moved behind the reply that follows them; see deferTail.
+        var deferred: std.Io.Writer.Allocating = .init(self.arena);
         var index = start;
         while (index < messages.len) {
             const message = messages[index];
@@ -700,7 +702,18 @@ const Renderer = struct {
             var consumed: usize = 1;
             switch (side) {
                 .assistant => try self.writeAssistant(&blocks.writer, message, next_before, first_wire),
-                .user => consumed = try self.writeUserRun(&blocks.writer, messages[index..]),
+                .user => {
+                    var kept: std.Io.Writer.Allocating = .init(self.arena);
+                    var tail: std.Io.Writer.Allocating = .init(self.arena);
+                    consumed = try self.writeUserRun(&kept.writer, &tail.writer, messages[index..]);
+                    try appendBlocks(&kept, deferred.written());
+                    deferred.clearRetainingCapacity();
+                    const next = index + consumed;
+                    if (next < messages.len and try self.deferTail(&body, current, kept.written(), tail.written(), messages[next])) {
+                        try deferred.writer.writeAll(tail.written());
+                    } else try appendBlocks(&kept, tail.written());
+                    try blocks.writer.writeAll(kept.written());
+                },
             }
             index += consumed;
             if (blocks.written().len == 0) continue;
@@ -711,7 +724,50 @@ const Renderer = struct {
             } else try body.writer.writeByte(',');
             try body.writer.writeAll(blocks.written());
         }
+        if (deferred.written().len != 0) {
+            if (current == .user) try body.writer.writeByte(',') else if (current) |open| try self.flush(w, &body, open, &wire_count);
+            try body.writer.writeAll(deferred.written());
+            current = .user;
+        }
         if (current) |open| try self.flush(w, &body, open, &wire_count);
+    }
+
+    fn appendBlocks(out: *std.Io.Writer.Allocating, blocks: []const u8) !void {
+        if (blocks.len == 0) return;
+        if (out.written().len != 0) try out.writer.writeByte(',');
+        try out.writer.writeAll(blocks);
+    }
+
+    /// fx adds notes, such as the session's file evidence, to the end of a
+    /// turn's last tool results after the turn's final reply exists. Sent in
+    /// place, they change the history that reply's thinking is bound to.
+    /// Returns true when the reply `next` was produced without `tail`, so
+    /// `tail` goes behind the reply instead, where the model first sees it.
+    fn deferTail(self: *Renderer, body: *std.Io.Writer.Allocating, open: ?Side, kept: []const u8, tail: []const u8, next: types.ChatMessage) !bool {
+        if (tail.len == 0 or kept.len == 0) return false;
+        if (next.role != .assistant or next.tool_calls.len != 0) return false;
+        const replay = next.provider_replay orelse return false;
+        const parsed = parseReplay(self.arena, replay.parts_json) catch return false;
+        if (parsed.prefix.len != 64) return false;
+        var full: std.Io.Writer.Allocating = .init(self.arena);
+        try full.writer.writeAll(kept);
+        try appendBlocks(&full, tail);
+        var hex = std.fmt.bytesToHex(try self.digestWith(body, open, full.written()), .lower);
+        if (std.mem.eql(u8, parsed.prefix, &hex)) return false;
+        hex = std.fmt.bytesToHex(try self.digestWith(body, open, kept), .lower);
+        const bound = std.mem.eql(u8, parsed.prefix, &hex);
+        if (bound) debug_trace.logf("gateway", "anthropic_user_tail_deferred bytes={d}", .{tail.len});
+        return bound;
+    }
+
+    fn digestWith(self: *Renderer, body: *std.Io.Writer.Allocating, open: ?Side, user_blocks: []const u8) ![32]u8 {
+        const saved = self.digest;
+        defer self.digest = saved;
+        if (open) |side| self.hashSegment(try self.wireMessage(body, side));
+        var user: std.Io.Writer.Allocating = .init(self.arena);
+        try user.writer.writeAll(user_blocks);
+        self.hashSegment(try self.wireMessage(&user, .user));
+        return self.digestNow();
     }
 
     fn wireMessage(self: *Renderer, body: *std.Io.Writer.Allocating, side: Side) ![]const u8 {
@@ -739,17 +795,18 @@ const Renderer = struct {
     }
 
     /// Writes a run of tool results and user messages as the blocks of one
-    /// user message, tool results first as the API requires. Returns how
-    /// many source messages it used.
-    fn writeUserRun(self: *Renderer, w: *std.Io.Writer, messages: []const types.ChatMessage) !usize {
+    /// user message: tool results to `results`, which the API requires first,
+    /// and the rest to `rest`. Returns how many source messages it used.
+    fn writeUserRun(self: *Renderer, results: *std.Io.Writer, rest: *std.Io.Writer, messages: []const types.ChatMessage) !usize {
         var count: usize = 0;
-        var wrote = false;
+        var wrote_results = false;
+        var wrote_rest = false;
         for (messages) |message| {
             if (message.role == .assistant) break;
             count += 1;
             switch (message.role) {
-                .tool => try self.writeToolResult(w, message, &wrote),
-                else => try self.writeUserBlocks(w, message, &wrote),
+                .tool => try self.writeToolResult(results, message, &wrote_results),
+                else => try self.writeUserBlocks(rest, message, &wrote_rest),
             }
         }
         return count;
@@ -1848,4 +1905,42 @@ test "anthropic codec releases every allocation on failure" {
             alloc.free(body);
         }
     }.run, .{});
+}
+
+test "anthropic notes fx adds after a turn's final reply move behind it and keep its thinking" {
+    const alloc = std.testing.allocator;
+    const call = [_]types.ToolCall{.{ .id = "toolu_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" }};
+    const turn = [_]types.ChatMessage{
+        .{ .role = .user, .content = "read a" },
+        .{ .role = .assistant, .tool_calls = &call },
+        .{ .role = .tool, .tool_call_id = "toolu_1", .tool_name = "read_file", .content = "A" },
+    };
+    const final_stream = sseEvent("message_start", "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_f\",\"usage\":{\"input_tokens\":5}}}") ++
+        sseEvent("content_block_start", "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"weigh it\",\"signature\":\"\"}}") ++
+        sseEvent("content_block_delta", "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"c2lnZg==\"}}") ++
+        sseEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}") ++
+        sseEvent("content_block_start", "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"It says A.\"}}") ++
+        sseEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":1}") ++
+        sseEvent("message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}") ++
+        sseEvent("message_stop", "{\"type\":\"message_stop\"}");
+    var result = try testStream(alloc, testRequest("claude-sonnet-5-5", &turn), final_stream, null);
+    defer result.deinit(alloc);
+    const replay: types.ProviderReplay = .{ .source = .{ .provider = test_provider, .model = "claude-sonnet-5-5" }, .parts_json = result.completed.completion.provider_state_json.? };
+    const next = turn ++ [_]types.ChatMessage{
+        .{ .role = .user, .content = "Session file evidence: a read" },
+        .{ .role = .assistant, .content = "It says A.", .provider_replay = replay },
+        .{ .role = .user, .content = "and b?" },
+    };
+    const body = try build_request(alloc, testRequest("claude-sonnet-5-5", &next), testSettings(&test_options));
+    defer alloc.free(body);
+    try expectContains(body, "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":[{\"type\":\"text\",\"text\":\"A\"}]}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"weigh it\",\"signature\":\"c2lnZg==\"},{\"type\":\"text\",\"text\":\"It says A.\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Session file evidence: a read\"},{\"type\":\"text\",\"text\":\"and b?\"}]}");
+
+    // An earlier edit that moving the note cannot undo keeps the note in place
+    // and leaves the thinking out.
+    var edited = next;
+    edited[0] = .{ .role = .user, .content = "read a, edited" };
+    const stripped = try build_request(alloc, testRequest("claude-sonnet-5-5", &edited), testSettings(&test_options));
+    defer alloc.free(stripped);
+    try std.testing.expect(std.mem.find(u8, stripped, "weigh it") == null);
+    try expectContains(stripped, "\"content\":[{\"type\":\"text\",\"text\":\"A\"}]},{\"type\":\"text\",\"text\":\"Session file evidence: a read\"}]}");
 }
